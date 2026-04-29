@@ -1,0 +1,16 @@
+{
+  "name": "claude-channel-whatsapp",
+  "version": "0.0.1",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": true,
+  "bin": "./server.mjs",
+  "scripts": {
+    "start": "npm install --silent --no-audit --no-fund && node server.mjs"
+  },
+  "dependencies": {
+    "@buzzie-ai/whatsapp-channel": "^4.2.1",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "zod": "^3.23.8"
+  }
+}
