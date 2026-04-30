@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.0.2' },
+  { name: 'whatsapp', version: '0.0.3' },
   {
     capabilities: {
       experimental: {
@@ -120,8 +120,9 @@ const mcp = new Server(
     },
     instructions:
       'Inbound WhatsApp messages arrive as <channel source="whatsapp" chat_id="..." sender="..." kind="dm|group|self" sender_name="...">. ' +
-      'Reply with the `reply` tool, passing chat_id from the tag. ' +
-      'Pairing codes from new senders are surfaced in the tag too — tell the user to run `/whatsapp:access pair <code>` to approve. ' +
+      'ALWAYS respond by calling the `reply` tool — never answer in plaintext. The remote user is on WhatsApp and cannot see anything in the terminal. ' +
+      'Pass the `chat_id` value from the tag verbatim (do not strip the @ suffix or modify it). ' +
+      'For pairing requests (kind="pairing_request"), do not auto-pair; tell the operator in plaintext to run `/whatsapp:access pair <code>`. ' +
       'Permission prompts can be relayed: a remote user replies with `yes <id>` or `no <id>` from the same chat to approve/deny.',
   },
 );
@@ -162,6 +163,17 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
+// Defensive: Claude may pass a phone number, a partial JID, or strip the
+// suffix. Coerce anything plausible to a Baileys-routable JID before sending.
+function coerceJid(input) {
+  if (!input || typeof input !== 'string') return input;
+  const v = input.trim();
+  if (v.includes('@')) return v;            // already a JID
+  const digits = v.replace(/[^0-9]/g, '');
+  if (digits.length >= 7) return digits + '@s.whatsapp.net';
+  return v;
+}
+
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   if (!safeSend) {
     return {
@@ -171,21 +183,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   const { name, arguments: args } = req.params;
+  console.warn(`[tool] ${name} args=${JSON.stringify(args).slice(0, 300)}`);
   try {
     if (name === 'reply') {
       const { chat_id, text } = args;
-      await safeSend(chat_id, { text });
-      return { content: [{ type: 'text', text: 'sent' }] };
+      const jid = coerceJid(chat_id);
+      const sent = await safeSend(jid, { text });
+      const sentId = sent?.key?.id || '(no id)';
+      console.warn(`[tool] reply → ${jid} sent_id=${sentId}`);
+      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
     }
     if (name === 'react') {
       const { chat_id, message_id, from_me = false, participant, emoji } = args;
-      const key = { remoteJid: chat_id, id: message_id, fromMe: from_me };
+      const jid = coerceJid(chat_id);
+      const key = { remoteJid: jid, id: message_id, fromMe: from_me };
       if (participant) key.participant = participant;
-      await safeSend(chat_id, { react: { text: emoji, key } });
+      await safeSend(jid, { react: { text: emoji, key } });
       return { content: [{ type: 'text', text: 'reacted' }] };
     }
     throw new Error(`unknown tool: ${name}`);
   } catch (err) {
+    console.warn(`[tool] error: ${err.message}`);
     return { content: [{ type: 'text', text: `Failed: ${err.message}` }], isError: true };
   }
 });
@@ -292,10 +310,19 @@ async function startWhatsApp() {
   // Track bot's own outgoing message ids to prevent re-processing as inbound.
   const sentByBot = new Set();
   safeSend = async (jid, content, options) => {
-    console.warn(`[send] to=${jid} type=${content.text ? 'text' : content.react ? 'react' : 'media'}`);
-    const sent = await sock.sendMessage(jid, content, options);
-    if (sent?.key?.id) sentByBot.add(sent.key.id);
-    return sent;
+    const kind = content.text ? 'text' : content.react ? 'react' : 'media';
+    const preview = content.text ? content.text.slice(0, 60) : '';
+    console.warn(`[send] to=${jid} kind=${kind}${preview ? ` "${preview}"` : ''}`);
+    try {
+      const sent = await sock.sendMessage(jid, content, options);
+      const id = sent?.key?.id;
+      if (id) sentByBot.add(id);
+      console.warn(`[send] result id=${id || '(none)'} status=${sent?.status ?? 'n/a'}`);
+      return sent;
+    } catch (err) {
+      console.warn(`[send] FAILED to=${jid}: ${err.message}`);
+      throw err;
+    }
   };
 
   // Catch up on any access.json approvals that landed before the watcher armed.
