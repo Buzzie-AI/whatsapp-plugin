@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.0.4' },
+  { name: 'whatsapp', version: '0.0.5' },
   {
     capabilities: {
       experimental: {
@@ -119,20 +119,24 @@ const mcp = new Server(
       tools: {},
     },
     instructions:
-      'You are bridged to WhatsApp via this channel. Inbound messages arrive as ' +
-      '<channel source="whatsapp" chat_id="..." sender="..." kind="dm|group|self" sender_name="...">{body}</channel>. ' +
-      '\n\nHARD RULES — follow these without exception:\n' +
-      '1. The sender is a remote person on WhatsApp. They CANNOT see anything in this terminal. ' +
-      'Plaintext responses you write here are invisible to them.\n' +
-      '2. For every <channel source="whatsapp"> event you MUST call the `reply` tool. ' +
-      'Pass `chat_id` exactly as it appears in the tag (keep the `@s.whatsapp.net` or `@g.us` suffix). ' +
-      'The tool is named `reply` and is loaded by the `whatsapp` MCP server in this session — ' +
-      'if you ever feel you cannot find it, you are wrong: list tools again before responding.\n' +
-      '3. Do NOT narrate the channel event back to the operator in the terminal. The operator can already see the inbound line. ' +
-      'Just call `reply` and let the tool result confirm the send.\n' +
-      '4. For events with kind="pairing_request", do not auto-approve. The operator must type `/whatsapp:access pair <code>` themselves. ' +
-      'You may briefly mention this in plaintext to the operator (this one case is allowed) but do not call `reply`.\n' +
-      '5. Permission prompts can be relayed: a remote sender replies `yes <id>` or `no <id>` from the same chat to approve/deny tool prompts.',
+      'You are bridged to WhatsApp via this channel. Inbound messages arrive as:\n' +
+      '<channel source="plugin:whatsapp:whatsapp" kind="dm|group|self|pairing_request" chat_id="..." sender="..." sender_name="..." msg_id="..." from_me="0|1">{body}</channel>\n' +
+      '\nWhen no <channel> event is present in the current turn, the reply/react tools will not appear in your toolset — that is expected. Do not call them speculatively. They are attached only on turns that include a channel event.\n' +
+      '\nTool reference (only valid in turns with a channel event):\n' +
+      '• `reply` — params: `chat_id` (string, the JID from the tag, KEEP the @s.whatsapp.net or @g.us suffix) and `text` (string, the outgoing message). The param is named `text`, not `body`/`message`/`content`.\n' +
+      '• `react` — params: `chat_id`, `message_id` (use the `msg_id` attribute from the inbound tag), `emoji` (single emoji, or `""` to remove). For group reactions also pass `participant` (the sender JID). Use react instead of reply when a lightweight ack suffices.\n' +
+      '\nKind values:\n' +
+      '• `dm` — a 1:1 chat with another contact.\n' +
+      '• `group` — a group chat (only forwarded if the operator has opted the group in via /whatsapp:access).\n' +
+      '• `self` — the operator messaging their own number ("self-chat"). This is the primary remote-control pattern. Always reply.\n' +
+      '• `pairing_request` — a new contact wants to pair. DO NOT auto-approve. Tell the operator in plaintext to run `/whatsapp:access pair <code>` (pulled from the tag). Do not call `reply` for this kind.\n' +
+      '\nfrom_me semantics:\n' +
+      '• `from_me="1"` on `kind="self"` is normal — that\'s how self-chat looks (the operator typing into their own number). Reply normally.\n' +
+      '• `from_me="1"` on `kind="dm"` or `kind="group"` is rare and means the operator typed from their own phone into someone else\'s chat. Don\'t auto-reply unless explicitly addressed.\n' +
+      '\nHard rules:\n' +
+      '1. The sender (except for kind="self") is on WhatsApp and CANNOT see your terminal output. Plaintext responses here are invisible to them — only the `reply` tool reaches them.\n' +
+      '2. Don\'t narrate the inbound back to the operator. The operator can already see the channel line.\n' +
+      '3. Permission prompts can be relayed: a trusted sender can reply `yes <id>` or `no <id>` from the same chat to approve/deny tool prompts.',
   },
 );
 
@@ -144,27 +148,28 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Send a WhatsApp message back over the channel. Pass the chat_id from the inbound <channel> tag.',
+        'Send a WhatsApp message back over the channel. Pass `chat_id` (JID from the inbound <channel> tag, including the @suffix) and `text` (the message body). The param is `text`, not `body`/`message`/`content`.',
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string', description: 'JID from the inbound channel tag' },
-          text: { type: 'string', description: 'Message text to send' },
+          chat_id: { type: 'string', description: 'JID from the inbound channel tag (e.g. 60123456789@s.whatsapp.net)' },
+          text: { type: 'string', description: 'Message text to send (param is named `text`)' },
         },
         required: ['chat_id', 'text'],
       },
     },
     {
       name: 'react',
-      description: 'React to a previously inbound message with an emoji.',
+      description:
+        'React to a previously inbound message with an emoji. Use this for a lightweight ack instead of a full reply.',
       inputSchema: {
         type: 'object',
         properties: {
-          chat_id: { type: 'string' },
-          message_id: { type: 'string', description: 'Inbound message id (from `msg_id` attribute)' },
-          from_me: { type: 'boolean', default: false },
-          participant: { type: 'string', description: 'For group messages: the sender JID' },
-          emoji: { type: 'string', description: 'Single emoji, or empty string to remove' },
+          chat_id: { type: 'string', description: 'JID from the inbound channel tag' },
+          message_id: { type: 'string', description: 'The `msg_id` attribute from the inbound channel tag' },
+          from_me: { type: 'boolean', default: false, description: 'Set to true if reacting to a message you (or the operator) sent' },
+          participant: { type: 'string', description: 'For group messages: the original sender JID' },
+          emoji: { type: 'string', description: 'Single emoji, or empty string "" to remove the reaction' },
         },
         required: ['chat_id', 'message_id', 'emoji'],
       },
@@ -191,11 +196,26 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     };
   }
 
-  const { name, arguments: args } = req.params;
+  const { name, arguments: args = {} } = req.params;
   console.warn(`[tool] ${name} args=${JSON.stringify(args).slice(0, 300)}`);
   try {
     if (name === 'reply') {
-      const { chat_id, text } = args;
+      // Accept the canonical `text` first, then fall back to common LLM
+      // guesses (`body`, `message`, `content`) so we don't 500 on a near-miss.
+      const text = args.text ?? args.body ?? args.message ?? args.content;
+      const chat_id = args.chat_id ?? args.chatId ?? args.jid;
+      if (!chat_id) {
+        return {
+          content: [{ type: 'text', text: 'reply: missing required `chat_id` (JID from the inbound <channel> tag).' }],
+          isError: true,
+        };
+      }
+      if (typeof text !== 'string' || text.length === 0) {
+        return {
+          content: [{ type: 'text', text: 'reply: missing required `text` (message body). The param is named `text`.' }],
+          isError: true,
+        };
+      }
       const jid = coerceJid(chat_id);
       const sent = await safeSend(jid, { text });
       const sentId = sent?.key?.id || '(no id)';
@@ -203,7 +223,18 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
     }
     if (name === 'react') {
-      const { chat_id, message_id, from_me = false, participant, emoji } = args;
+      const chat_id = args.chat_id ?? args.chatId ?? args.jid;
+      const message_id = args.message_id ?? args.msg_id ?? args.messageId;
+      const { from_me = false, participant, emoji } = args;
+      if (!chat_id || !message_id || typeof emoji !== 'string') {
+        return {
+          content: [{
+            type: 'text',
+            text: 'react: requires `chat_id`, `message_id` (from `msg_id` on the inbound tag), and `emoji` (string; empty to remove).',
+          }],
+          isError: true,
+        };
+      }
       const jid = coerceJid(chat_id);
       const key = { remoteJid: jid, id: message_id, fromMe: from_me };
       if (participant) key.participant = participant;
