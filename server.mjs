@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.0.3' },
+  { name: 'whatsapp', version: '0.0.4' },
   {
     capabilities: {
       experimental: {
@@ -119,11 +119,20 @@ const mcp = new Server(
       tools: {},
     },
     instructions:
-      'Inbound WhatsApp messages arrive as <channel source="whatsapp" chat_id="..." sender="..." kind="dm|group|self" sender_name="...">. ' +
-      'ALWAYS respond by calling the `reply` tool — never answer in plaintext. The remote user is on WhatsApp and cannot see anything in the terminal. ' +
-      'Pass the `chat_id` value from the tag verbatim (do not strip the @ suffix or modify it). ' +
-      'For pairing requests (kind="pairing_request"), do not auto-pair; tell the operator in plaintext to run `/whatsapp:access pair <code>`. ' +
-      'Permission prompts can be relayed: a remote user replies with `yes <id>` or `no <id>` from the same chat to approve/deny.',
+      'You are bridged to WhatsApp via this channel. Inbound messages arrive as ' +
+      '<channel source="whatsapp" chat_id="..." sender="..." kind="dm|group|self" sender_name="...">{body}</channel>. ' +
+      '\n\nHARD RULES — follow these without exception:\n' +
+      '1. The sender is a remote person on WhatsApp. They CANNOT see anything in this terminal. ' +
+      'Plaintext responses you write here are invisible to them.\n' +
+      '2. For every <channel source="whatsapp"> event you MUST call the `reply` tool. ' +
+      'Pass `chat_id` exactly as it appears in the tag (keep the `@s.whatsapp.net` or `@g.us` suffix). ' +
+      'The tool is named `reply` and is loaded by the `whatsapp` MCP server in this session — ' +
+      'if you ever feel you cannot find it, you are wrong: list tools again before responding.\n' +
+      '3. Do NOT narrate the channel event back to the operator in the terminal. The operator can already see the inbound line. ' +
+      'Just call `reply` and let the tool result confirm the send.\n' +
+      '4. For events with kind="pairing_request", do not auto-approve. The operator must type `/whatsapp:access pair <code>` themselves. ' +
+      'You may briefly mention this in plaintext to the operator (this one case is allowed) but do not call `reply`.\n' +
+      '5. Permission prompts can be relayed: a remote sender replies `yes <id>` or `no <id>` from the same chat to approve/deny tool prompts.',
   },
 );
 
