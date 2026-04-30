@@ -38,18 +38,48 @@ WhatsApp account talks to a Baileys client running on your machine.
 
 ### 1. Link your WhatsApp account
 
-The companion CLI handles QR / pairing-code login. In a separate terminal:
+Authentication is handled by the companion CLI shipped with
+[`@buzzie-ai/whatsapp-channel`](https://www.npmjs.com/package/@buzzie-ai/whatsapp-channel).
+The package exposes a `whatsapp` bin. In a **separate terminal** (the channel
+server itself is non-interactive):
+
+**Option A — install once, run anywhere**
 
 ```bash
-# QR code (interactive)
-npx -y @buzzie-ai/whatsapp-channel login
+npm install -g @buzzie-ai/whatsapp-channel
 
-# Or pairing code (headless / SSH)
-npx -y @buzzie-ai/whatsapp-channel login --pairing-code 60123456789
+# QR code login (interactive — needs a terminal that can render the QR)
+whatsapp login
+
+# Or pairing-code login (headless / SSH — pass your full international
+# phone number, digits only, no `+`). WhatsApp will display an 8-character
+# code on your phone; type it on the website prompt the CLI shows.
+whatsapp login --pairing-code 60123456789
+
+whatsapp status     # confirm the link
+whatsapp logout     # unlink + clear local credentials
 ```
 
-This writes auth credentials to `~/.whatsapp-cli/auth/`. The channel server
-reuses them at startup.
+**Option B — one-shot via `npx` (no global install)**
+
+```bash
+npx -y -p @buzzie-ai/whatsapp-channel whatsapp login
+npx -y -p @buzzie-ai/whatsapp-channel whatsapp login --pairing-code 60123456789
+```
+
+The `-p <package> <bin>` form is the portable way to run a bin whose name
+(`whatsapp`) differs from the package name.
+
+**Where credentials live.** The CLI writes session files to
+`~/.whatsapp-cli/auth/` (set `WHATSAPP_CLI_HOME` to override the parent
+directory — useful for Docker volumes or multi-account setups). The Claude
+Code channel server reuses the same directory at startup, so once
+`whatsapp status` says you're linked, the plugin is good to go.
+
+> **Headless servers.** Use `whatsapp login --pairing-code <phone>` —
+> WhatsApp shows the 8-character code on your phone under
+> *Settings → Linked Devices → Link with phone number instead*. Type that
+> code where the CLI prompts.
 
 ### 2. Install the plugin
 

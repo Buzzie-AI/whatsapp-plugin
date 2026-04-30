@@ -43,8 +43,8 @@ Show the user the complete picture in this order:
 
 3. **What next** — end with a concrete next step:
    - **Not linked** → *"Link your phone first. In a separate terminal:*
-     `npx -y @buzzie-ai/whatsapp-channel login` *(scans QR), or*
-     `npx -y @buzzie-ai/whatsapp-channel login --pairing-code <phone>` *for headless servers. Then exit Claude Code and restart with `--channels plugin:whatsapp@<marketplace>`."*
+     `npx -y -p @buzzie-ai/whatsapp-channel whatsapp login` *(QR), or*
+     `npx -y -p @buzzie-ai/whatsapp-channel whatsapp login --pairing-code <phone>` *for headless servers (enter the 8-character code WhatsApp shows on your phone). Then exit Claude Code and restart with `--channels plugin:whatsapp@buzzie-ai`."*
    - **Linked, allowlist empty, policy `pairing`** → *"Send any message to yourself on WhatsApp. The bot replies with a pairing code; approve with* `/whatsapp:access pair <code>` *to capture your own JID. Texting yourself bypasses pairing once you're in."*
    - **Linked, someone allowed, policy still `pairing`** → *"Lock down with* `/whatsapp:access policy allowlist`. *Pairing should only be on while you're capturing IDs."*
    - **Linked, policy `allowlist`** → *"Locked. Anyone new needs to be added explicitly with* `/whatsapp:access allow <jid>`."
@@ -56,10 +56,26 @@ a long-term policy. Once known senders are in the allowlist, flip to
 ### `link` — kick off interactive login
 
 Tell the user: *"WhatsApp linking is interactive (QR or pairing code). Open a
-separate terminal and run* `npx -y @buzzie-ai/whatsapp-channel login` *(QR) or*
-`npx -y @buzzie-ai/whatsapp-channel login --pairing-code <phone>` *(headless).
-Once you see "Logged in as ...", come back and restart Claude Code with the
-`--channels` flag."*
+separate terminal and run one of:*
+
+```bash
+# QR (interactive terminal)
+npx -y -p @buzzie-ai/whatsapp-channel whatsapp login
+
+# Pairing code (headless / SSH) — phone is full international, digits only
+npx -y -p @buzzie-ai/whatsapp-channel whatsapp login --pairing-code 60123456789
+```
+
+*With pairing-code mode, WhatsApp shows an 8-character code on your phone
+under Settings → Linked Devices → Link with phone number instead. Enter that
+code at the CLI prompt.*
+
+*Once `whatsapp status` says you're linked, come back and restart Claude
+Code with `--channels plugin:whatsapp@buzzie-ai`."*
+
+Note the `-p <package> <bin>` form: the package is `@buzzie-ai/whatsapp-channel`
+but the bin is named `whatsapp`. Older `npx` versions won't auto-resolve a
+mismatched package/bin name.
 
 Do **not** try to run the login command from inside the Claude Code session —
 it requires an interactive terminal that can render a QR code or read user
@@ -67,9 +83,9 @@ input.
 
 ### `unlink` / `logout`
 
-Tell the user to run `npx -y @buzzie-ai/whatsapp-channel logout` in a separate
-terminal, then restart Claude Code. Mention that this revokes the device link
-on WhatsApp's side.
+Tell the user to run `npx -y -p @buzzie-ai/whatsapp-channel whatsapp logout`
+in a separate terminal, then restart Claude Code. Mention that this revokes
+the device link on WhatsApp's side and clears `~/.whatsapp-cli/auth/`.
 
 ### `status` — alias for no-args
 
