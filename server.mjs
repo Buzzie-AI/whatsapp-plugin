@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.0.5' },
+  { name: 'whatsapp', version: '0.1.0' },
   {
     capabilities: {
       experimental: {

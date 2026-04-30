@@ -5,6 +5,11 @@ Claude Code. Receive WhatsApp messages in your running session and reply
 through the same chat — like a chat bridge between WhatsApp and your local
 terminal.
 
+```text
+/plugin marketplace add Buzzie-AI/whatsapp-plugin
+/plugin install whatsapp@buzzie-ai
+```
+
 Built on [@buzzie-ai/whatsapp-channel](https://www.npmjs.com/package/@buzzie-ai/whatsapp-channel)
 (Baileys protocol). No bot token, no third-party gateway — your linked
 WhatsApp account talks to a Baileys client running on your machine.
@@ -48,19 +53,26 @@ reuses them at startup.
 
 ### 2. Install the plugin
 
+In Claude Code:
+
 ```text
-/plugin install whatsapp@<your-marketplace>
+/plugin marketplace add Buzzie-AI/whatsapp-plugin
+/plugin install whatsapp@buzzie-ai
 ```
 
-While this plugin is unpublished you can also load it directly from disk via
-your project's `.mcp.json` and `--dangerously-load-development-channels`
-(see [Develop locally](#develop-locally) below).
+The first command registers this repo as a marketplace; the second installs
+the `whatsapp` plugin from it.
 
 ### 3. Restart Claude Code with the channel enabled
 
 ```bash
-claude --channels plugin:whatsapp@<your-marketplace>
+claude --channels plugin:whatsapp@buzzie-ai
 ```
+
+> **Heads up — research-preview channels.** Custom channels are not yet on
+> Claude Code's approved allowlist. If `--channels plugin:whatsapp@buzzie-ai`
+> errors, run with `--dangerously-load-development-channels plugin:whatsapp@buzzie-ai`
+> until the flag is no longer required.
 
 ### 4. Test it
 
@@ -95,7 +107,7 @@ no further pairing codes are issued.
 ## Develop locally
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/Buzzie-AI/whatsapp-plugin
 cd whatsapp-plugin
 npm install
 ```
