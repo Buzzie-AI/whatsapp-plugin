@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.0.1' },
+  { name: 'whatsapp', version: '0.0.2' },
   {
     capabilities: {
       experimental: {
@@ -278,11 +278,21 @@ async function startWhatsApp() {
   const selfJid = normalizeJid(sock.user?.id || '');
   const selfPhone = jidToPhone(selfJid);
   const selfChatJid = `${selfPhone}@s.whatsapp.net`;
-  console.warn(`Connected as ${selfPhone}`);
+  // WhatsApp's LID system: self-chat may arrive on `<lid>@lid` instead of the
+  // legacy `<phone>@s.whatsapp.net`. We detect both inbound, but always send
+  // outbound to the PN form so messages land in the user's visible self-chat.
+  const selfLidRaw = sock.user?.lid || null;
+  const selfChatLid = selfLidRaw
+    ? selfLidRaw.split(':')[0].split('@')[0] + '@lid'
+    : null;
+  console.warn(
+    `Connected as ${selfPhone}${selfChatLid ? ` (lid: ${selfChatLid})` : ''}`,
+  );
 
   // Track bot's own outgoing message ids to prevent re-processing as inbound.
   const sentByBot = new Set();
   safeSend = async (jid, content, options) => {
+    console.warn(`[send] to=${jid} type=${content.text ? 'text' : content.react ? 'react' : 'media'}`);
     const sent = await sock.sendMessage(jid, content, options);
     if (sent?.key?.id) sentByBot.add(sent.key.id);
     return sent;
@@ -321,9 +331,14 @@ async function startWhatsApp() {
     const text = extractBody(msg);
     if (!text) return; // ignore reactions, media without captions, etc. for now
 
-    const chatId = rawJid;
-    const isGroup = isGroupJid(chatId);
-    const isSelf = chatId === selfChatJid && msg.key.fromMe;
+    const isGroup = isGroupJid(rawJid);
+    const isSelfRaw =
+      (rawJid === selfChatJid || (selfChatLid && rawJid === selfChatLid)) &&
+      msg.key.fromMe;
+    // Canonicalize self-chat to the PN form so reply tool / pairing acks
+    // always target the user's visible self-chat, not the LID twin.
+    const chatId = isSelfRaw ? selfChatJid : rawJid;
+    const isSelf = isSelfRaw;
 
     // Sender JID: in groups it's `participant`; in DMs it's the chat JID.
     const senderRaw = msg.key.fromMe
