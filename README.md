@@ -129,10 +129,16 @@ no further pairing codes are issued.
 
 ## Tools exposed to Claude
 
-| Tool   | Purpose                                                  |
-| ------ | -------------------------------------------------------- |
-| `reply` | Send a text reply to a WhatsApp chat by JID             |
-| `react` | React to an inbound message with an emoji               |
+| Tool   | When available | Purpose |
+| ------ | -------------- | ------- |
+| `reply` | Channel-gated (only on turns with a `<channel>` event) | Send a text reply to a WhatsApp chat by JID |
+| `react` | Channel-gated | React to an inbound message with an emoji |
+| `send`  | Always-on (intended for autonomous outbound) | Fire an unsolicited message — cron alerts, capital events, autopilot pings. `text` required; `chat_id` defaults to the operator self-chat. |
+
+> The `send` tool exists so cron-triggered or otherwise autonomous turns can
+> push messages out through the plugin's existing Baileys session, instead of
+> spinning up a second client (which would conflict with the persistent
+> session — WhatsApp Web only allows one device-link socket at a time).
 
 ## Develop locally
 

@@ -109,7 +109,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.1.0' },
+  { name: 'whatsapp', version: '0.2.0' },
   {
     capabilities: {
       experimental: {
@@ -121,8 +121,10 @@ const mcp = new Server(
     instructions:
       'You are bridged to WhatsApp via this channel. Inbound messages arrive as:\n' +
       '<channel source="plugin:whatsapp:whatsapp" kind="dm|group|self|pairing_request" chat_id="..." sender="..." sender_name="..." msg_id="..." from_me="0|1">{body}</channel>\n' +
-      '\nWhen no <channel> event is present in the current turn, the reply/react tools will not appear in your toolset — that is expected. Do not call them speculatively. They are attached only on turns that include a channel event.\n' +
-      '\nTool reference (only valid in turns with a channel event):\n' +
+      '\nThis server exposes tools in two availability tiers. Channel-gated tools only appear on turns that include a <channel> event from this server; do not call them speculatively. The unsolicited-outbound tool (`send`) is intended to be available regardless of channel context, for cron-fired alerts and autonomous notifications.\n' +
+      '\nTools available regardless of channel context:\n' +
+      '• `send` — fire an unsolicited outbound message. params: `text` (required), `chat_id` (optional; defaults to the operator self-chat). Use for cron-fired alerts, capital events, autopilot pings.\n' +
+      '\nTools attached only on turns that include a <channel> event:\n' +
       '• `reply` — params: `chat_id` (string, the JID from the tag, KEEP the @s.whatsapp.net or @g.us suffix) and `text` (string, the outgoing message). The param is named `text`, not `body`/`message`/`content`.\n' +
       '• `react` — params: `chat_id`, `message_id` (use the `msg_id` attribute from the inbound tag), `emoji` (single emoji, or `""` to remove). For group reactions also pass `participant` (the sender JID). Use react instead of reply when a lightweight ack suffices.\n' +
       '\nKind values:\n' +
@@ -142,6 +144,7 @@ const mcp = new Server(
 
 // ── Reply tool ──────────────────────────────────────────────────────────────
 let safeSend = null; // wired up after Baileys connects
+let selfChatJidRef = null; // exposed to `send` tool as the default target
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -172,6 +175,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           emoji: { type: 'string', description: 'Single emoji, or empty string "" to remove the reaction' },
         },
         required: ['chat_id', 'message_id', 'emoji'],
+      },
+    },
+    {
+      name: 'send',
+      description:
+        'Send an unsolicited WhatsApp message (autonomous notification — no inbound channel event required). Use for cron-fired alerts, capital events, autopilot pings. Defaults to the operator self-chat if `chat_id` is omitted. Pass plain digits as `chat_id` and the plugin will coerce to a JID.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Target JID or phone digits. Optional — defaults to the linked self-chat.' },
+          text: { type: 'string', description: 'Message body.' },
+        },
+        required: ['text'],
       },
     },
   ],
@@ -220,6 +236,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       const sent = await safeSend(jid, { text });
       const sentId = sent?.key?.id || '(no id)';
       console.warn(`[tool] reply → ${jid} sent_id=${sentId}`);
+      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
+    }
+    if (name === 'send') {
+      const text = args.text ?? args.body ?? args.message ?? args.content;
+      if (typeof text !== 'string' || text.length === 0) {
+        return { content: [{ type: 'text', text: 'send: missing required `text`.' }], isError: true };
+      }
+      const rawChat = args.chat_id ?? args.chatId ?? args.jid ?? args.phone ?? selfChatJidRef;
+      if (!rawChat) {
+        return { content: [{ type: 'text', text: 'send: no `chat_id` provided and self-chat JID not yet known (Baileys not connected?).' }], isError: true };
+      }
+      const jid = coerceJid(rawChat);
+      const sent = await safeSend(jid, { text });
+      const sentId = sent?.key?.id || '(no id)';
+      console.warn(`[tool] send → ${jid} sent_id=${sentId}`);
       return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
     }
     if (name === 'react') {
@@ -336,6 +367,7 @@ async function startWhatsApp() {
   const selfJid = normalizeJid(sock.user?.id || '');
   const selfPhone = jidToPhone(selfJid);
   const selfChatJid = `${selfPhone}@s.whatsapp.net`;
+  selfChatJidRef = selfChatJid;
   // WhatsApp's LID system: self-chat may arrive on `<lid>@lid` instead of the
   // legacy `<phone>@s.whatsapp.net`. We detect both inbound, but always send
   // outbound to the PN form so messages land in the user's visible self-chat.
