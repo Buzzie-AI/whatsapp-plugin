@@ -4,20 +4,15 @@
 // inbound messages into the running session as <channel source="whatsapp" ...>.
 // Self-chat is auto-allowed; everyone else pairs via /whatsapp:access.
 
-// Keep stdout reserved for MCP JSON-RPC. Anything else goes to stderr.
-const _stderr = (...a) =>
-  process.stderr.write(a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') + '\n');
-console.log = _stderr;
-console.info = _stderr;
-console.warn = _stderr;
-
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
+  appendFileSync,
   existsSync,
   mkdirSync,
   readFileSync,
   readdirSync,
+  statSync,
   unlinkSync,
   watch,
   writeFileSync,
@@ -41,9 +36,48 @@ import {
 const CHANNEL_DIR = join(homedir(), '.claude', 'channels', 'whatsapp');
 const ACCESS_PATH = join(CHANNEL_DIR, 'access.json');
 const APPROVED_DIR = join(CHANNEL_DIR, 'approved');
+const LOG_PATH = join(CHANNEL_DIR, 'server.log');
+const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5MB
 
 mkdirSync(CHANNEL_DIR, { recursive: true });
 mkdirSync(APPROVED_DIR, { recursive: true });
+
+// ── Logging ─────────────────────────────────────────────────────────────────
+// MCP keeps stdout reserved for JSON-RPC. Tee everything diagnostic to:
+//   (a) stderr — visible to whoever launched Claude Code
+//   (b) ~/.claude/channels/whatsapp/server.log — `tail -f` for live diagnosis
+// Logging never throws; if the file is unwritable we still get stderr.
+function rotateIfNeeded() {
+  try {
+    const sz = statSync(LOG_PATH).size;
+    if (sz > LOG_MAX_BYTES) {
+      try { unlinkSync(LOG_PATH + '.1'); } catch { /* no prior rotation */ }
+      try {
+        // rename via writeFileSync trick: read+write old+truncate. Cheapest:
+        // copy to .1 then truncate. Use writeFileSync('') to truncate.
+        const data = readFileSync(LOG_PATH);
+        writeFileSync(LOG_PATH + '.1', data);
+        writeFileSync(LOG_PATH, '');
+      } catch { /* keep going even if rotation fails */ }
+    }
+  } catch { /* file doesn't exist yet — fine */ }
+}
+function logLine(...a) {
+  const line =
+    new Date().toISOString() + ' ' +
+    a.map((x) => (typeof x === 'string' ? x : JSON.stringify(x))).join(' ') +
+    '\n';
+  process.stderr.write(line);
+  try {
+    appendFileSync(LOG_PATH, line);
+  } catch { /* never let logging crash the server */ }
+}
+rotateIfNeeded();
+console.log = logLine;
+console.info = logLine;
+console.warn = logLine;
+console.error = logLine;
+logLine(`[boot] whatsapp channel server starting; log file: ${LOG_PATH}`);
 
 // ── JID helpers (inlined; not exported by the package) ─────────────────────
 const isGroupJid = (jid) => typeof jid === 'string' && jid.endsWith('@g.us');
@@ -109,7 +143,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.2.0' },
+  { name: 'whatsapp', version: '0.2.1' },
   {
     capabilities: {
       experimental: {
@@ -402,33 +436,48 @@ async function startWhatsApp() {
 
   const startTs = Math.floor(Date.now() / 1000);
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
+  sock.ev.on('messages.upsert', async ({ messages, type }) => {
+    console.warn(`[in] messages.upsert type=${type} count=${messages.length}`);
     for (const msg of messages) {
       try {
         await handleInbound(msg);
       } catch (err) {
-        console.warn('handleInbound error:', err.message);
+        console.warn('[in] handleInbound error:', err.message);
       }
     }
   });
 
   async function handleInbound(msg) {
-    if (!msg.message) return;
+    if (!msg.message) {
+      console.warn('[in] skip reason=no-message-body');
+      return;
+    }
     const rawJid = msg.key.remoteJid;
-    if (!rawJid) return;
+    if (!rawJid) {
+      console.warn('[in] skip reason=no-remoteJid');
+      return;
+    }
 
     // Skip our own outgoing messages (acks, bot replies).
     if (msg.key.id && sentByBot.has(msg.key.id)) {
       sentByBot.delete(msg.key.id);
+      console.warn(`[in] skip reason=own-echo msgId=${msg.key.id}`);
       return;
     }
 
     // Skip history-sync replays.
     const ts = Number(msg.messageTimestamp || 0);
-    if (ts && ts < startTs - 5) return;
+    if (ts && ts < startTs - 5) {
+      console.warn(`[in] skip reason=history-replay msgId=${msg.key.id} ts=${ts} startTs=${startTs}`);
+      return;
+    }
 
     const text = extractBody(msg);
-    if (!text) return; // ignore reactions, media without captions, etc. for now
+    if (!text) {
+      console.warn(`[in] skip reason=no-text msgId=${msg.key.id} from=${rawJid} (reaction/media-no-caption?)`);
+      return;
+    }
+    console.warn(`[in] from=${rawJid} fromMe=${msg.key.fromMe ? 1 : 0} msgId=${msg.key.id} preview="${text.slice(0, 60)}"`);
 
     const isGroup = isGroupJid(rawJid);
     const isSelfRaw =
@@ -455,12 +504,11 @@ async function startWhatsApp() {
       const requestId = verdict[2].toLowerCase();
       const open = pendingPermissions.get(requestId);
       if (open && open.chatId === chatId) {
+        const behavior = verdict[1].toLowerCase().startsWith('y') ? 'allow' : 'deny';
+        console.warn(`[in] permission verdict request_id=${requestId} behavior=${behavior} from=${sender}`);
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
-          params: {
-            request_id: requestId,
-            behavior: verdict[1].toLowerCase().startsWith('y') ? 'allow' : 'deny',
-          },
+          params: { request_id: requestId, behavior },
         });
         pendingPermissions.delete(requestId);
         return;
@@ -501,6 +549,7 @@ async function startWhatsApp() {
     }
 
     if (pairingCode) {
+      console.warn(`[in] decision=pairing-requested code=${pairingCode} sender=${sender} chat=${chatId}`);
       // Surface the pairing event in the session so Claude can prompt the user
       // (and also DM the requester so they know it's pending).
       await safeSend(chatId, {
@@ -510,6 +559,7 @@ async function startWhatsApp() {
           `(code expires in 10 minutes)`,
       }).catch(() => {});
       lastInboundChat = { chatId, senderId: sender };
+      console.warn(`[in] forward kind=pairing_request chat=${chatId} sender=${sender}`);
       await mcp.notification({
         method: 'notifications/claude/channel',
         params: {
@@ -526,11 +576,18 @@ async function startWhatsApp() {
       return;
     }
 
-    if (!allowed) return; // silent drop
+    if (!allowed) {
+      const dropReason = isGroup
+        ? (access.groups[chatId] ? 'group-filter-mismatch' : 'group-not-opted-in')
+        : (access.dmPolicy === 'disabled' ? 'dm-policy-disabled' : 'dm-not-allowlisted');
+      console.warn(`[in] decision=dropped kind=${kind} reason=${dropReason} sender=${sender} chat=${chatId} dmPolicy=${access.dmPolicy}`);
+      return; // silent drop
+    }
 
     // Track most recent trusted chat for permission relay routing.
     lastInboundChat = { chatId, senderId: sender };
 
+    console.warn(`[in] forward kind=${kind} chat=${chatId} sender=${sender} msgId=${msg.key.id || ''}`);
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {

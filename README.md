@@ -140,6 +140,41 @@ no further pairing codes are issued.
 > spinning up a second client (which would conflict with the persistent
 > session — WhatsApp Web only allows one device-link socket at a time).
 
+## Diagnostics
+
+The channel server tees all diagnostic output to:
+
+```
+~/.claude/channels/whatsapp/server.log
+```
+
+Tail it to watch the live message flow:
+
+```bash
+tail -f ~/.claude/channels/whatsapp/server.log
+```
+
+What you'll see when a WhatsApp message arrives:
+
+```
+2026-05-04T... [in] messages.upsert type=notify count=1
+2026-05-04T... [in] from=60123456789@s.whatsapp.net fromMe=1 msgId=ABC preview="hey"
+2026-05-04T... [in] forward kind=self chat=60123456789@s.whatsapp.net sender=...
+```
+
+Common drop reasons (each emits its own `[in] skip` or `[in] decision=dropped` line):
+
+| Reason | Meaning |
+| ------ | ------- |
+| `own-echo` | A message the bot itself just sent — filtered to avoid loops. |
+| `history-replay` | Baileys replayed a message older than the session — ignored. |
+| `no-text` | Reaction or media without caption — nothing to forward. |
+| `dm-not-allowlisted` | DM from a sender not in `allowFrom`; with `dmPolicy: pairing`, a code is issued instead. |
+| `group-not-opted-in` | Group hasn't been added with `/whatsapp:access group add`. |
+| `group-filter-mismatch` | Group is opted in but mention pattern or per-group allowlist rejected the message. |
+
+The log auto-rotates at 5MB (previous file kept as `server.log.1`). Outbound `[tool] reply`, `[tool] send`, and `[send]` lines also land here, so a single `tail -f` shows the full request/response cycle.
+
 ## Develop locally
 
 ```bash
