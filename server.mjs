@@ -91,10 +91,21 @@ function normalizeJid(jid) {
   return user.split(':')[0] + '@' + server;
 }
 
-// Pull plain text out of a Baileys message. Mirrors the package's extractBody.
+// Pull plain text out of a Baileys message. Unwraps common containers
+// (disappearing/view-once) before pulling the body out.
 function extractBody(msg) {
-  const m = msg?.message;
+  let m = msg?.message;
   if (!m) return '';
+  // Unwrap disappearing / view-once envelopes — Baileys 7.x wraps a lot of
+  // text content in these even when the user didn't enable view-once UI.
+  for (let i = 0; i < 4; i++) {
+    if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
+    if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
+    if (m.viewOnceMessageV2?.message) { m = m.viewOnceMessageV2.message; continue; }
+    if (m.viewOnceMessageV2Extension?.message) { m = m.viewOnceMessageV2Extension.message; continue; }
+    if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
+    break;
+  }
   return (
     m.conversation ||
     m.extendedTextMessage?.text ||
@@ -143,7 +154,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.2.1' },
+  { name: 'whatsapp', version: '0.2.2' },
   {
     capabilities: {
       experimental: {
@@ -449,7 +460,20 @@ async function startWhatsApp() {
 
   async function handleInbound(msg) {
     if (!msg.message) {
-      console.warn('[in] skip reason=no-message-body');
+      // Distinguish: protocol/system event vs. messageStub vs. decrypt-fail.
+      // Decryption failures show up as a bare msg with no .message and no
+      // .messageStubType — strong signal of session-key staleness (often
+      // from a parallel Baileys client clobbering ~/.whatsapp-cli/auth/).
+      const stub = msg.messageStubType ? ` stubType=${msg.messageStubType}` : '';
+      const stubParams = msg.messageStubParameters?.length
+        ? ` stubParams=${JSON.stringify(msg.messageStubParameters).slice(0, 100)}`
+        : '';
+      const looksLikeDecryptFail = !msg.messageStubType && !msg.message && msg.key?.id && !msg.key?.fromMe;
+      const hint = looksLikeDecryptFail ? ' HINT=likely-decrypt-fail-or-session-conflict' : '';
+      console.warn(
+        `[in] skip reason=no-message-body msgId=${msg.key?.id} from=${msg.key?.remoteJid} ` +
+        `fromMe=${msg.key?.fromMe ? 1 : 0}${stub}${stubParams}${hint}`,
+      );
       return;
     }
     const rawJid = msg.key.remoteJid;
@@ -474,7 +498,11 @@ async function startWhatsApp() {
 
     const text = extractBody(msg);
     if (!text) {
-      console.warn(`[in] skip reason=no-text msgId=${msg.key.id} from=${rawJid} (reaction/media-no-caption?)`);
+      const messageKeys = Object.keys(msg.message || {}).join(',');
+      console.warn(
+        `[in] skip reason=no-text msgId=${msg.key.id} from=${rawJid} ` +
+        `messageKeys=[${messageKeys}] (reaction/media-no-caption/unknown-wrapper?)`,
+      );
       return;
     }
     console.warn(`[in] from=${rawJid} fromMe=${msg.key.fromMe ? 1 : 0} msgId=${msg.key.id} preview="${text.slice(0, 60)}"`);
