@@ -1,7 +1,7 @@
 {
   "name": "whatsapp",
   "description": "WhatsApp channel for Claude Code — messaging bridge built on Baileys via @buzzie-ai/whatsapp-channel. Self-chat is auto-allowed; everyone else pairs through /whatsapp:access.",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "homepage": "https://github.com/Buzzie-AI/whatsapp-plugin",
   "license": "Apache-2.0",
   "author": {

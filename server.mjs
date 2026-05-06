@@ -123,7 +123,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.4.0' },
+  { name: 'whatsapp', version: '0.4.1' },
   {
     capabilities: {
       experimental: {
@@ -555,7 +555,7 @@ async function startWhatsApp() {
     // Track most recent trusted chat for permission relay routing.
     lastInboundChat = { chatId, senderId: sender };
 
-    console.warn(`[in] forward kind=${kind} chat=${chatId} sender=${sender} msgId=${msg.key.id || ''}`);
+    console.warn(`[in] forward kind=${kind} chat=${chatId} sender=${sender} msgId=${msgId || ''}`);
     await mcp.notification({
       method: 'notifications/claude/channel',
       params: {
@@ -565,8 +565,8 @@ async function startWhatsApp() {
           chat_id: chatId,
           sender,
           sender_name: senderName,
-          msg_id: msg.key.id || '',
-          from_me: msg.key.fromMe ? '1' : '0',
+          msg_id: msgId || '',
+          from_me: fromMe ? '1' : '0',
         },
       },
     });
