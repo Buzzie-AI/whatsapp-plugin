@@ -1,10 +1,14 @@
 #!/usr/bin/env node
 // WhatsApp channel server for Claude Code.
-// Uses @buzzie-ai/whatsapp-channel's `createClient` (auto-reconnecting,
-// queue-on-disconnect) to bridge WhatsApp into the running Claude Code
-// session as <channel source="whatsapp" ...> events. The client owns the
-// Baileys socket lifecycle, so transient WS drops no longer wedge the bridge.
-// Self-chat is auto-allowed; everyone else pairs via /whatsapp:access.
+// Bridges WhatsApp into the running session as <channel source="whatsapp" ...>
+// events. Built on @buzzie-ai/whatsapp-channel's `createClient` (4.7+), which
+// owns the Baileys socket lifecycle (auto-reconnect with queue-on-disconnect)
+// AND normalizes the inbound stream — envelope unwrapping, LID-twin
+// canonicalization, echo dedup, history/live split, and JID coercion all live
+// in the package. What's left here is purely Claude-Code policy: the MCP tool
+// surface, access control (DM pairing / group allowlist / mention regex),
+// pairing-code lifecycle, and the permission relay. Self-chat is auto-allowed;
+// everyone else pairs via /whatsapp:access.
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -81,43 +85,6 @@ console.warn = logLine;
 console.error = logLine;
 logLine(`[boot] whatsapp channel server starting; log file: ${LOG_PATH}`);
 
-// ── JID helpers (inlined; not exported by the package) ─────────────────────
-const isGroupJid = (jid) => typeof jid === 'string' && jid.endsWith('@g.us');
-const jidToPhone = (jid) => (jid ? String(jid).split('@')[0].split(':')[0] : '');
-
-// Strip Baileys' lid suffix (`123:45@s.whatsapp.net` → `123@s.whatsapp.net`).
-function normalizeJid(jid) {
-  if (!jid) return jid;
-  const [user, server] = jid.split('@');
-  if (!server) return jid;
-  return user.split(':')[0] + '@' + server;
-}
-
-// Pull plain text out of a Baileys message. Unwraps common containers
-// (disappearing/view-once) before pulling the body out.
-function extractBody(msg) {
-  let m = msg?.message;
-  if (!m) return '';
-  // Unwrap disappearing / view-once envelopes — Baileys 7.x wraps a lot of
-  // text content in these even when the user didn't enable view-once UI.
-  for (let i = 0; i < 4; i++) {
-    if (m.ephemeralMessage?.message) { m = m.ephemeralMessage.message; continue; }
-    if (m.viewOnceMessage?.message) { m = m.viewOnceMessage.message; continue; }
-    if (m.viewOnceMessageV2?.message) { m = m.viewOnceMessageV2.message; continue; }
-    if (m.viewOnceMessageV2Extension?.message) { m = m.viewOnceMessageV2Extension.message; continue; }
-    if (m.documentWithCaptionMessage?.message) { m = m.documentWithCaptionMessage.message; continue; }
-    break;
-  }
-  return (
-    m.conversation ||
-    m.extendedTextMessage?.text ||
-    m.imageMessage?.caption ||
-    m.videoMessage?.caption ||
-    m.documentMessage?.caption ||
-    ''
-  );
-}
-
 // ── Access state ────────────────────────────────────────────────────────────
 function defaultAccess() {
   return {
@@ -156,7 +123,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.3.0' },
+  { name: 'whatsapp', version: '0.4.0' },
   {
     capabilities: {
       experimental: {
@@ -190,9 +157,31 @@ const mcp = new Server(
 );
 
 // ── Reply tool ──────────────────────────────────────────────────────────────
-let safeSend = null; // wired up after Baileys connects
-let selfChatJidRef = null; // exposed to `send` tool as the default target
-let waClient = null; // managed createClient handle; module-scoped for shutdown
+// Single module-scoped client handle. Echo dedup, identity (whoami), and
+// JID coercion all live inside the client now, so we no longer maintain a
+// `sentByBot` Set, a cached selfChatJidRef, or a coerceJid helper for sends.
+let waClient = null;
+
+// Thin logging wrapper around client.send. Used by every outbound site
+// (tool handlers, permission relay, approval ack, pairing prompt) so the
+// `[send]` log format stays consistent. `to` accepts digits or JID — the
+// client coerces internally.
+async function safeSend(to, content, options) {
+  if (!waClient) throw new Error('WhatsApp client not connected');
+  const kind = content.text ? 'text' : content.react ? 'react' : 'media';
+  const preview = content.text ? content.text.slice(0, 60) : '';
+  console.warn(
+    `[send] to=${to} kind=${kind}${preview ? ` "${preview}"` : ''} client=${waClient.status}`,
+  );
+  try {
+    const sent = await waClient.send(to, content, options);
+    console.warn(`[send] result id=${sent?.key?.id || '(none)'} status=${sent?.status ?? 'n/a'}`);
+    return sent;
+  } catch (err) {
+    console.warn(`[send] FAILED to=${to}: ${err.message}`);
+    throw err;
+  }
+}
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -241,19 +230,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-// Defensive: Claude may pass a phone number, a partial JID, or strip the
-// suffix. Coerce anything plausible to a Baileys-routable JID before sending.
-function coerceJid(input) {
-  if (!input || typeof input !== 'string') return input;
-  const v = input.trim();
-  if (v.includes('@')) return v;            // already a JID
-  const digits = v.replace(/[^0-9]/g, '');
-  if (digits.length >= 7) return digits + '@s.whatsapp.net';
-  return v;
-}
-
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
-  if (!safeSend) {
+  if (!waClient) {
     return {
       content: [{ type: 'text', text: 'Not connected to WhatsApp yet. Run `whatsapp login` first.' }],
       isError: true,
@@ -280,26 +258,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
-      const jid = coerceJid(chat_id);
-      const sent = await safeSend(jid, { text });
+      // client.send (via safeSend) accepts digits or JID; no local coercion needed.
+      const sent = await safeSend(chat_id, { text });
       const sentId = sent?.key?.id || '(no id)';
-      console.warn(`[tool] reply → ${jid} sent_id=${sentId}`);
-      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
+      console.warn(`[tool] reply → ${chat_id} sent_id=${sentId}`);
+      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${chat_id})` }] };
     }
     if (name === 'send') {
       const text = args.text ?? args.body ?? args.message ?? args.content;
       if (typeof text !== 'string' || text.length === 0) {
         return { content: [{ type: 'text', text: 'send: missing required `text`.' }], isError: true };
       }
-      const rawChat = args.chat_id ?? args.chatId ?? args.jid ?? args.phone ?? selfChatJidRef;
-      if (!rawChat) {
-        return { content: [{ type: 'text', text: 'send: no `chat_id` provided and self-chat JID not yet known (Baileys not connected?).' }], isError: true };
+      const rawChat = args.chat_id ?? args.chatId ?? args.jid ?? args.phone;
+      // No chat_id ⇒ default to operator self-chat via client.selfSend.
+      // We thread through safeSend by resolving the target via whoami() so the
+      // `[send]` log format stays uniform with the explicit-chat path.
+      const target = rawChat ?? waClient.whoami()?.selfChatJid;
+      if (!target) {
+        return { content: [{ type: 'text', text: 'send: self-chat JID not yet known (client not connected?).' }], isError: true };
       }
-      const jid = coerceJid(rawChat);
-      const sent = await safeSend(jid, { text });
+      const sent = await safeSend(target, { text });
       const sentId = sent?.key?.id || '(no id)';
-      console.warn(`[tool] send → ${jid} sent_id=${sentId}`);
-      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${jid})` }] };
+      console.warn(`[tool] send → ${target} sent_id=${sentId}`);
+      return { content: [{ type: 'text', text: `sent (id=${sentId} to=${target})` }] };
     }
     if (name === 'react') {
       const chat_id = args.chat_id ?? args.chatId ?? args.jid;
@@ -314,7 +295,14 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           isError: true,
         };
       }
-      const jid = coerceJid(chat_id);
+      // client.react(evt, emoji) wants an InboundEvent we don't have on the
+      // MCP-tool call path (Claude only gives us scalar args), so we build
+      // the Baileys reaction key directly and route through send. key.remoteJid
+      // must be a real JID — the client's coercion only fires on the send
+      // target, not on what we stuff into the key — so coerce locally here.
+      const jid = chat_id.includes('@')
+        ? chat_id
+        : chat_id.replace(/[^0-9]/g, '') + '@s.whatsapp.net';
       const key = { remoteJid: jid, id: message_id, fromMe: from_me };
       if (participant) key.participant = participant;
       await safeSend(jid, { react: { text: emoji, key } });
@@ -344,7 +332,7 @@ const PermissionRequestSchema = z.object({
 
 mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   const target = lastInboundChat;
-  if (!target || !safeSend) return;
+  if (!target || !waClient) return;
   pendingPermissions.set(params.request_id, target);
   const body =
     `Claude wants to run ${params.tool_name}: ${params.description}\n\n` +
@@ -377,7 +365,7 @@ function processApprovals() {
     } catch {
       continue;
     }
-    if (!chatId || !safeSend) continue;
+    if (!chatId || !waClient) continue;
     safeSend(chatId, {
       text: '✅ You are paired with this Claude Code session. Send me a message to get started.',
     })
@@ -412,146 +400,69 @@ async function startWhatsApp() {
 
   // Surface client lifecycle for diagnosis. The client owns the socket and
   // auto-reconnects on transient drops; sends queue across the gap rather
-  // than throwing "Connection Closed", which is the bug this upgrade fixes.
+  // than throwing "Connection Closed".
   waClient.on('status', (s) => console.warn(`[client] status=${s}`));
   waClient.on('error', (err) => console.warn(`[client] error: ${err.message}`));
 
-  // Identity is fixed for the auth session — capture once from the underlying
-  // socket. The client may swap the socket on reconnect, so read .user
-  // synchronously and don't hold the reference across awaits.
-  const sock0 = waClient.getSocket();
-  const selfJid = normalizeJid(sock0?.user?.id || '');
-  const selfPhone = jidToPhone(selfJid);
-  const selfChatJid = `${selfPhone}@s.whatsapp.net`;
-  selfChatJidRef = selfChatJid;
-  // WhatsApp's LID system: self-chat may arrive on `<lid>@lid` instead of the
-  // legacy `<phone>@s.whatsapp.net`. We detect both inbound, but always send
-  // outbound to the PN form so messages land in the user's visible self-chat.
-  const selfLidRaw = sock0?.user?.lid || null;
-  const selfChatLid = selfLidRaw
-    ? selfLidRaw.split(':')[0].split('@')[0] + '@lid'
-    : null;
+  // Identity is exposed by the client and stable across reconnects — no need
+  // to dive through getSocket() ourselves anymore.
+  const me = waClient.whoami();
   console.warn(
-    `Connected as ${selfPhone}${selfChatLid ? ` (lid: ${selfChatLid})` : ''}`,
+    `Connected as ${me?.phone}${me?.lid ? ` (lid: ${me.lid})` : ''}`,
   );
 
-  // Best-effort presence — uses the getSocket() escape hatch since the client
-  // doesn't expose presence helpers. OK if it fails (transient WS state); the
-  // bridge functions fine without it.
+  // Best-effort presence — fails fast when disconnected (which is fine; the
+  // bridge functions without it). The package wraps `sendPresenceUpdate`.
   try {
-    await waClient.getSocket()?.sendPresenceUpdate('available');
+    await waClient.presence('available');
   } catch (err) {
     console.warn(`[boot] presence update failed: ${err.message}`);
   }
 
-  // Track bot's own outgoing message ids to prevent re-processing as inbound.
-  const sentByBot = new Set();
-  safeSend = async (jid, content, options) => {
-    const kind = content.text ? 'text' : content.react ? 'react' : 'media';
-    const preview = content.text ? content.text.slice(0, 60) : '';
-    console.warn(
-      `[send] to=${jid} kind=${kind}${preview ? ` "${preview}"` : ''} client=${waClient.status}`,
-    );
-    try {
-      // client.send() forwards to sock.sendMessage when connected and queues
-      // when not — so this resolves once delivery actually happens, even if
-      // the WS dropped between our call and the ack.
-      const sent = await waClient.send(jid, content, options);
-      const id = sent?.key?.id;
-      if (id) sentByBot.add(id);
-      console.warn(`[send] result id=${id || '(none)'} status=${sent?.status ?? 'n/a'}`);
-      return sent;
-    } catch (err) {
-      console.warn(`[send] FAILED to=${jid}: ${err.message}`);
-      throw err;
-    }
-  };
-
   // Catch up on any access.json approvals that landed before the watcher armed.
   processApprovals();
 
-  const startTs = Math.floor(Date.now() / 1000);
-
-  // Inbound stream — client emits per-message with the upsert `type`. We skip
-  // non-`notify` types here (history-sync replays, status updates) and keep
-  // the per-message timestamp guard inside handleInbound as a second filter.
-  waClient.on('message', async (msg, type) => {
-    if (type !== 'notify') {
-      console.warn(`[in] skip reason=non-notify type=${type} msgId=${msg.key?.id}`);
-      return;
-    }
+  // Inbound — the client emits cooked InboundEvents on 'inbound' (live messages
+  // only; history goes to 'history'). Echo dedup, envelope unwrapping, LID
+  // canonicalization, and sender extraction all happen upstream, so we just
+  // wire the event into our access-control + forward path.
+  waClient.on('inbound', async (evt) => {
     try {
-      await handleInbound(msg);
+      await handleInbound(evt);
     } catch (err) {
       console.warn('[in] handleInbound error:', err.message);
     }
   });
 
-  async function handleInbound(msg) {
-    if (!msg.message) {
-      // Distinguish: protocol/system event vs. messageStub vs. decrypt-fail.
-      // Decryption failures show up as a bare msg with no .message and no
-      // .messageStubType — strong signal of session-key staleness (often
-      // from a parallel Baileys client clobbering ~/.whatsapp-cli/auth/).
-      const stub = msg.messageStubType ? ` stubType=${msg.messageStubType}` : '';
-      const stubParams = msg.messageStubParameters?.length
-        ? ` stubParams=${JSON.stringify(msg.messageStubParameters).slice(0, 100)}`
-        : '';
-      const looksLikeDecryptFail = !msg.messageStubType && !msg.message && msg.key?.id && !msg.key?.fromMe;
-      const hint = looksLikeDecryptFail ? ' HINT=likely-decrypt-fail-or-session-conflict' : '';
-      console.warn(
-        `[in] skip reason=no-message-body msgId=${msg.key?.id} from=${msg.key?.remoteJid} ` +
-        `fromMe=${msg.key?.fromMe ? 1 : 0}${stub}${stubParams}${hint}`,
-      );
-      return;
-    }
-    const rawJid = msg.key.remoteJid;
-    if (!rawJid) {
-      console.warn('[in] skip reason=no-remoteJid');
-      return;
-    }
+  // Optional diagnostic — count history-sync messages we've chosen to ignore,
+  // so a quiet bridge has at least one log line confirming traffic is reaching
+  // us. Not forwarded to Claude.
+  let historyCount = 0;
+  waClient.on('history', () => {
+    historyCount += 1;
+    if (historyCount % 50 === 0) console.warn(`[in] history-sync count=${historyCount}`);
+  });
 
-    // Skip our own outgoing messages (acks, bot replies).
-    if (msg.key.id && sentByBot.has(msg.key.id)) {
-      sentByBot.delete(msg.key.id);
-      console.warn(`[in] skip reason=own-echo msgId=${msg.key.id}`);
-      return;
-    }
+  async function handleInbound(evt) {
+    const { chatId, kind, sender, senderName, text, msgId, fromMe } = evt;
 
-    // Skip history-sync replays.
-    const ts = Number(msg.messageTimestamp || 0);
-    if (ts && ts < startTs - 5) {
-      console.warn(`[in] skip reason=history-replay msgId=${msg.key.id} ts=${ts} startTs=${startTs}`);
-      return;
-    }
-
-    const text = extractBody(msg);
     if (!text) {
-      const messageKeys = Object.keys(msg.message || {}).join(',');
+      // Reactions, media-no-caption, and unknown wrappers all surface as
+      // empty text. Log enough to triage but don't try to parse them — the
+      // package's escape hatch (evt.raw) is there if a future feature needs it.
+      const rawKeys = Object.keys(evt.raw?.message || {}).join(',');
       console.warn(
-        `[in] skip reason=no-text msgId=${msg.key.id} from=${rawJid} ` +
-        `messageKeys=[${messageKeys}] (reaction/media-no-caption/unknown-wrapper?)`,
+        `[in] skip reason=no-text msgId=${msgId} from=${chatId} ` +
+        `rawKeys=[${rawKeys}] (reaction/media-no-caption?)`,
       );
       return;
     }
-    console.warn(`[in] from=${rawJid} fromMe=${msg.key.fromMe ? 1 : 0} msgId=${msg.key.id} preview="${text.slice(0, 60)}"`);
+    console.warn(
+      `[in] from=${chatId} fromMe=${fromMe ? 1 : 0} kind=${kind} msgId=${msgId} preview="${text.slice(0, 60)}"`,
+    );
 
-    const isGroup = isGroupJid(rawJid);
-    const isSelfRaw =
-      (rawJid === selfChatJid || (selfChatLid && rawJid === selfChatLid)) &&
-      msg.key.fromMe;
-    // Canonicalize self-chat to the PN form so reply tool / pairing acks
-    // always target the user's visible self-chat, not the LID twin.
-    const chatId = isSelfRaw ? selfChatJid : rawJid;
-    const isSelf = isSelfRaw;
-
-    // Sender JID: in groups it's `participant`; in DMs it's the chat JID.
-    const senderRaw = msg.key.fromMe
-      ? selfChatJid
-      : (isGroup ? (msg.key.participant || rawJid) : rawJid);
-    const sender = normalizeJid(senderRaw);
-    const senderName = msg.pushName || jidToPhone(sender);
-
+    const isSelf = kind === 'self';
+    const isGroup = kind === 'group';
     const access = readAccess();
 
     // Permission-verdict path: only honor verdicts from already-trusted senders.
@@ -573,7 +484,7 @@ async function startWhatsApp() {
     }
 
     // ── Decide whether to forward ──
-    let kind = isSelf ? 'self' : isGroup ? 'group' : 'dm';
+    // `kind` is already on the InboundEvent; no recomputation needed.
     let allowed = false;
     let pairingCode = null;
 
@@ -620,7 +531,7 @@ async function startWhatsApp() {
       await mcp.notification({
         method: 'notifications/claude/channel',
         params: {
-          content: `New pairing request from ${senderName} (${jidToPhone(sender)}). Run /whatsapp:access pair ${pairingCode} to approve, or /whatsapp:access deny ${pairingCode} to reject.`,
+          content: `New pairing request from ${senderName} (${sender.split('@')[0]}). Run /whatsapp:access pair ${pairingCode} to approve, or /whatsapp:access deny ${pairingCode} to reject.`,
           meta: {
             kind: 'pairing_request',
             chat_id: chatId,
