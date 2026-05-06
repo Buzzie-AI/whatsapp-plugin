@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 // WhatsApp channel server for Claude Code.
-// Connects to WhatsApp through @buzzie-ai/whatsapp-channel (Baileys) and pushes
-// inbound messages into the running session as <channel source="whatsapp" ...>.
+// Uses @buzzie-ai/whatsapp-channel's `createClient` (auto-reconnecting,
+// queue-on-disconnect) to bridge WhatsApp into the running Claude Code
+// session as <channel source="whatsapp" ...> events. The client owns the
+// Baileys socket lifecycle, so transient WS drops no longer wedge the bridge.
 // Self-chat is auto-allowed; everyone else pairs via /whatsapp:access.
 
 import { homedir } from 'node:os';
@@ -28,7 +30,7 @@ import { z } from 'zod';
 
 import {
   authExists,
-  connectAndWait,
+  createClient,
   getAuthDir,
 } from '@buzzie-ai/whatsapp-channel';
 
@@ -154,7 +156,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.2.2' },
+  { name: 'whatsapp', version: '0.3.0' },
   {
     capabilities: {
       experimental: {
@@ -190,6 +192,7 @@ const mcp = new Server(
 // ── Reply tool ──────────────────────────────────────────────────────────────
 let safeSend = null; // wired up after Baileys connects
 let selfChatJidRef = null; // exposed to `send` tool as the default target
+let waClient = null; // managed createClient handle; module-scoped for shutdown
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
@@ -400,23 +403,31 @@ async function startWhatsApp() {
     return;
   }
 
-  let sock;
   try {
-    sock = await connectAndWait({ authDir, printQr: false, syncFullHistory: false });
-    await sock.sendPresenceUpdate('available');
+    waClient = await createClient({ authDir, syncFullHistory: false });
   } catch (err) {
     console.error('Failed to connect to WhatsApp:', err.message);
     return;
   }
 
-  const selfJid = normalizeJid(sock.user?.id || '');
+  // Surface client lifecycle for diagnosis. The client owns the socket and
+  // auto-reconnects on transient drops; sends queue across the gap rather
+  // than throwing "Connection Closed", which is the bug this upgrade fixes.
+  waClient.on('status', (s) => console.warn(`[client] status=${s}`));
+  waClient.on('error', (err) => console.warn(`[client] error: ${err.message}`));
+
+  // Identity is fixed for the auth session — capture once from the underlying
+  // socket. The client may swap the socket on reconnect, so read .user
+  // synchronously and don't hold the reference across awaits.
+  const sock0 = waClient.getSocket();
+  const selfJid = normalizeJid(sock0?.user?.id || '');
   const selfPhone = jidToPhone(selfJid);
   const selfChatJid = `${selfPhone}@s.whatsapp.net`;
   selfChatJidRef = selfChatJid;
   // WhatsApp's LID system: self-chat may arrive on `<lid>@lid` instead of the
   // legacy `<phone>@s.whatsapp.net`. We detect both inbound, but always send
   // outbound to the PN form so messages land in the user's visible self-chat.
-  const selfLidRaw = sock.user?.lid || null;
+  const selfLidRaw = sock0?.user?.lid || null;
   const selfChatLid = selfLidRaw
     ? selfLidRaw.split(':')[0].split('@')[0] + '@lid'
     : null;
@@ -424,14 +435,28 @@ async function startWhatsApp() {
     `Connected as ${selfPhone}${selfChatLid ? ` (lid: ${selfChatLid})` : ''}`,
   );
 
+  // Best-effort presence — uses the getSocket() escape hatch since the client
+  // doesn't expose presence helpers. OK if it fails (transient WS state); the
+  // bridge functions fine without it.
+  try {
+    await waClient.getSocket()?.sendPresenceUpdate('available');
+  } catch (err) {
+    console.warn(`[boot] presence update failed: ${err.message}`);
+  }
+
   // Track bot's own outgoing message ids to prevent re-processing as inbound.
   const sentByBot = new Set();
   safeSend = async (jid, content, options) => {
     const kind = content.text ? 'text' : content.react ? 'react' : 'media';
     const preview = content.text ? content.text.slice(0, 60) : '';
-    console.warn(`[send] to=${jid} kind=${kind}${preview ? ` "${preview}"` : ''}`);
+    console.warn(
+      `[send] to=${jid} kind=${kind}${preview ? ` "${preview}"` : ''} client=${waClient.status}`,
+    );
     try {
-      const sent = await sock.sendMessage(jid, content, options);
+      // client.send() forwards to sock.sendMessage when connected and queues
+      // when not — so this resolves once delivery actually happens, even if
+      // the WS dropped between our call and the ack.
+      const sent = await waClient.send(jid, content, options);
       const id = sent?.key?.id;
       if (id) sentByBot.add(id);
       console.warn(`[send] result id=${id || '(none)'} status=${sent?.status ?? 'n/a'}`);
@@ -447,14 +472,18 @@ async function startWhatsApp() {
 
   const startTs = Math.floor(Date.now() / 1000);
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    console.warn(`[in] messages.upsert type=${type} count=${messages.length}`);
-    for (const msg of messages) {
-      try {
-        await handleInbound(msg);
-      } catch (err) {
-        console.warn('[in] handleInbound error:', err.message);
-      }
+  // Inbound stream — client emits per-message with the upsert `type`. We skip
+  // non-`notify` types here (history-sync replays, status updates) and keep
+  // the per-message timestamp guard inside handleInbound as a second filter.
+  waClient.on('message', async (msg, type) => {
+    if (type !== 'notify') {
+      console.warn(`[in] skip reason=non-notify type=${type} msgId=${msg.key?.id}`);
+      return;
+    }
+    try {
+      await handleInbound(msg);
+    } catch (err) {
+      console.warn('[in] handleInbound error:', err.message);
     }
   });
 
@@ -674,3 +703,17 @@ async function issuePairingCode(senderId, chatId, senderName) {
 // ── Boot ────────────────────────────────────────────────────────────────────
 await mcp.connect(new StdioServerTransport());
 startWhatsApp().catch((err) => console.error('WhatsApp connect crashed:', err));
+
+// Clean shutdown — close the WhatsApp client so its reconnect loop stops and
+// any queued sends reject promptly instead of dangling. Idempotent.
+async function shutdown(signal) {
+  console.warn(`[boot] ${signal} received, closing WhatsApp client`);
+  try {
+    await waClient?.close();
+  } catch (err) {
+    console.warn(`[boot] client.close failed: ${err.message}`);
+  }
+  process.exit(0);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
