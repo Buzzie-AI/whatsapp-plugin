@@ -1,6 +1,6 @@
 {
   "name": "claude-channel-whatsapp",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "license": "Apache-2.0",
   "type": "module",
   "private": true,
@@ -11,6 +11,7 @@
   "dependencies": {
     "@buzzie-ai/whatsapp-channel": "^4.7.0",
     "@modelcontextprotocol/sdk": "^1.27.1",
+    "proper-lockfile": "^4.1.2",
     "zod": "^3.23.8"
   }
 }

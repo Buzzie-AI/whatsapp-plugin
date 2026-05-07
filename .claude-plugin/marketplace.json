@@ -9,7 +9,7 @@
       "name": "whatsapp",
       "source": "./",
       "description": "WhatsApp channel for Claude Code — receive messages and reply through your linked WhatsApp account. Built on Baileys via @buzzie-ai/whatsapp-channel.",
-      "version": "0.4.1",
+      "version": "0.4.2",
       "category": "channels",
       "keywords": ["whatsapp", "messaging", "channel", "mcp", "baileys"],
       "homepage": "https://github.com/Buzzie-AI/whatsapp-plugin",

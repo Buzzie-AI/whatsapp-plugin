@@ -31,6 +31,7 @@ import {
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
 import { z } from 'zod';
+import lockfile from 'proper-lockfile';
 
 import {
   authExists,
@@ -85,6 +86,57 @@ console.warn = logLine;
 console.error = logLine;
 logLine(`[boot] whatsapp channel server starting; log file: ${LOG_PATH}`);
 
+// ── Single-instance lock ────────────────────────────────────────────────────
+// WhatsApp permits exactly one active socket per paired device. Two
+// `node server.mjs` processes pointed at the same auth dir kick each other
+// off in a tight `connected → reconnecting → connected` storm (~1 Hz),
+// because the WhatsApp server force-closes the older socket every time the
+// newer one reconnects. The two losers are then unable to send or receive
+// reliably, and SIGTERM cleanup wedges trying to close a flapping socket.
+//
+// We serialize at the host level via an advisory lock on the auth dir.
+// proper-lockfile uses an atomic mkdir for the lock indicator and an mtime
+// heartbeat to detect dead holders. A SIGKILL'd holder's lock goes stale
+// within `stale` ms; a hung-but-alive holder's heartbeat keeps firing
+// (libuv timers fire even when business logic is blocked on an await), so
+// the lock correctly stays held. The losing instance writes a one-line
+// diagnostic and exits 0 — this is the expected outcome, not an error.
+const authDir = getAuthDir();
+mkdirSync(authDir, { recursive: true }); // first-pair flow: dir may not exist
+const LOCK_PATH = join(authDir, '.lock');
+const LOCK_PID_PATH = join(authDir, '.lock.pid');
+
+let releaseLock = null;
+try {
+  releaseLock = await lockfile.lock(authDir, {
+    lockfilePath: LOCK_PATH,
+    stale: 10000,        // declare lock stale after 10s of no heartbeat
+    update: 5000,        // heartbeat mtime every 5s
+    retries: 0,          // we're a daemon, not a queue worker — fail fast
+    onCompromised: (err) => {
+      // Lock was lost mid-run (mtime updates failing, or another process
+      // forced the lock dir away). Don't keep running with a half-claim
+      // on the WhatsApp socket — exit and let the harness restart us.
+      console.error(`[boot] lock compromised: ${err.message}; exiting`);
+      process.exit(1);
+    },
+  });
+  // Diagnostic PID file as a sibling of the lock dir so the loser can name
+  // us. Best-effort — never fail boot just because we can't write the PID.
+  try { writeFileSync(LOCK_PID_PATH, String(process.pid)); } catch { /* ignore */ }
+  logLine(`[boot] acquired lock pid=${process.pid} path=${LOCK_PATH}`);
+} catch (err) {
+  if (err.code === 'ELOCKED') {
+    let peerPid = '?';
+    try { peerPid = readFileSync(LOCK_PID_PATH, 'utf8').trim() || '?'; } catch { /* ignore */ }
+    logLine(`[boot] peer pid=${peerPid} holds ${LOCK_PATH}; exiting`);
+    process.exit(0);
+  }
+  // Anything else (permission denied on the auth dir, etc.) is unexpected.
+  console.error(`[boot] lock acquire failed: ${err.message}`);
+  throw err;
+}
+
 // ── Access state ────────────────────────────────────────────────────────────
 function defaultAccess() {
   return {
@@ -123,7 +175,7 @@ function newPairingCode() {
 
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.4.1' },
+  { name: 'whatsapp', version: '0.4.2' },
   {
     capabilities: {
       experimental: {
@@ -379,7 +431,7 @@ function processApprovals() {
 watch(APPROVED_DIR, { persistent: false }, () => processApprovals());
 
 // ── Connect to WhatsApp and wire up message routing ─────────────────────────
-const authDir = getAuthDir();
+// authDir is hoisted up above the lock block.
 
 async function startWhatsApp() {
   if (!authExists(authDir)) {
@@ -624,6 +676,10 @@ async function shutdown(signal) {
   } catch (err) {
     console.warn(`[boot] client.close failed: ${err.message}`);
   }
+  // Release the host-level lock immediately so a replacement instance can
+  // acquire without waiting for the stale window. OS cleans up regardless
+  // on SIGKILL / OOM via the same stale window.
+  try { await releaseLock?.(); } catch { /* best-effort */ }
   process.exit(0);
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
