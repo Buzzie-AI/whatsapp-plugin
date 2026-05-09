@@ -19,10 +19,12 @@ WhatsApp account talks to a Baileys client running on your machine.
 - **Self-chat as a remote control.** Text yourself on WhatsApp; the message
   arrives in your running Claude Code session as a `<channel>` event. Claude
   acts on it and replies back through WhatsApp.
-- **Anyone else has to pair first.** First inbound DM from an unknown sender
-  gets a 6-character pairing code. You approve from your terminal with
-  `/whatsapp:access pair <code>`.
-- **Group chats** can be opted in with mention-pattern gating.
+- **Groups as workspaces, operator-only.** Opt a group in with
+  `/whatsapp:access group add <groupJid>`. Only your own messages in that
+  group forward to the session; messages from other participants are
+  silently dropped.
+- **DMs from other contacts are never forwarded.** No pairing prompts, no
+  auto-replies — your normal WhatsApp keeps behaving like normal WhatsApp.
 - **Permission relay.** When Claude tries to run a tool that needs approval,
   the prompt is forwarded through WhatsApp; reply `yes <id>` or `no <id>`
   from your phone to allow or deny.
@@ -110,21 +112,21 @@ Send a message to yourself on WhatsApp. It should arrive in your terminal as
 a `<channel source="whatsapp">` event, and Claude can reply back through the
 same chat.
 
-To let other contacts reach the session: have them DM your linked number,
-then in Claude Code run:
+To use a group as a workspace, in Claude Code run:
 
 ```text
-/whatsapp:access pair <code>
-/whatsapp:access policy allowlist
+/whatsapp:access group add 120363012345@g.us
 ```
 
-The first command captures their JID; the second locks down the channel so
-no further pairing codes are issued.
+(Find the group JID by sending any message into the group and reading the
+`from=` field on the `[in]` line in `~/.claude/channels/whatsapp/server.log`.)
+Only messages you type from your own phone into that group will forward;
+everyone else's are dropped.
 
 ## Slash commands
 
 - `/whatsapp:configure` — show auth + access status, point to next step.
-- `/whatsapp:access` — pair codes, manage allowlist, change policy. See
+- `/whatsapp:access` — opt groups in or out and inspect state. See
   [ACCESS.md](./ACCESS.md).
 
 ## Tools exposed to Claude
@@ -169,9 +171,9 @@ Common drop reasons (each emits its own `[in] skip` or `[in] decision=dropped` l
 | `own-echo` | A message the bot itself just sent — filtered to avoid loops. |
 | `history-replay` | Baileys replayed a message older than the session — ignored. |
 | `no-text` | Reaction or media without caption — nothing to forward. |
-| `dm-not-allowlisted` | DM from a sender not in `allowFrom`; with `dmPolicy: pairing`, a code is issued instead. |
+| `dm-forwarding-disabled` | DM from a non-self sender — DMs are never forwarded under the operator-only model. |
 | `group-not-opted-in` | Group hasn't been added with `/whatsapp:access group add`. |
-| `group-filter-mismatch` | Group is opted in but mention pattern or per-group allowlist rejected the message. |
+| `group-not-operator` | Group is opted in but the sender isn't the linked WhatsApp account; only operator-typed messages forward. |
 
 The log auto-rotates at 5MB (previous file kept as `server.log.1`). Outbound `[tool] reply`, `[tool] send`, and `[send]` lines also land here, so a single `tail -f` shows the full request/response cycle.
 
@@ -205,14 +207,16 @@ claude --dangerously-load-development-channels server:whatsapp
 
 ## Security model
 
-- **Sender allowlist.** Only JIDs in `allowFrom` (or your own self-chat) can
-  push events into the session. Unknown senders silently drop, except in
-  pairing mode where they get a one-time code that has to be approved from
-  your terminal.
-- **Group gating.** Groups must be explicitly added via `/whatsapp:access
-  group add`. By default they require a mention match.
-- **Permission relay scoped to trusted senders.** Only senders already in
-  `allowFrom` (or self) can answer permission prompts.
+- **DMs from other contacts are never forwarded.** No allowlist to maintain,
+  no pairing codes to leak — strangers messaging your linked number reach
+  the server log and stop there. Your normal WhatsApp stays normal.
+- **Groups are opt-in and operator-only.** A group must be explicitly added
+  via `/whatsapp:access group add`. Even then, only messages whose sender
+  matches the linked account's `me.id` / `me.lid` forward — group admins
+  adding malicious participants can't push events into the session.
+- **Permission relay reaches only the operator.** Only self-chat and the
+  operator's own messages in opted-in groups ever reach the relay, so the
+  trust surface for tool approvals is the operator's WhatsApp account.
 - **No outbound until linked.** If `~/.whatsapp-cli/auth/creds.json` is
   missing, the MCP server still connects but tool calls fail with a clear
   message and no message-pushing happens.

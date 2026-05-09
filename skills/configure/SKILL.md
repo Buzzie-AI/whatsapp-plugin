@@ -1,6 +1,6 @@
 ---
 name: configure
-description: Set up the WhatsApp channel — link a phone number, review auth status, and orient on access policy. Use when the user asks to configure WhatsApp, asks "how do I link my phone," wants to check channel status, or pastes a phone number for pairing.
+description: Set up the WhatsApp channel — link a phone number, review auth status, and show what the channel is forwarding. Use when the user asks to configure WhatsApp, asks "how do I link my phone," wants to check channel status, or pastes a phone number for the device-linking login.
 user-invocable: true
 allowed-tools:
   - Read
@@ -35,23 +35,23 @@ Show the user the complete picture in this order:
    - If yes: read `me.id` from that JSON and show "linked as +<phone>".
    - If no: state "not linked".
 
-2. **Access** — read `~/.claude/channels/whatsapp/access.json` (missing file
-   = defaults: `dmPolicy: "pairing"`, empty allowlist). Show:
-   - DM policy and what it means in one line.
-   - Allowed senders: count, plus their JIDs.
-   - Pending pairings: count with codes, sender names, and ages.
+2. **Access** — read `~/.claude/channels/whatsapp/access.json` (missing
+   file = `{groups:{}}`). Show:
+   - "Self-chat: always forwarded."
+   - Opted-in groups: count, then a list of JIDs.
+   - "DMs from other contacts are never forwarded."
 
 3. **What next** — end with a concrete next step:
    - **Not linked** → *"Link your phone first. In a separate terminal:*
      `npx -y -p @buzzie-ai/whatsapp-channel whatsapp login` *(QR), or*
      `npx -y -p @buzzie-ai/whatsapp-channel whatsapp login --pairing-code <phone>` *for headless servers (enter the 8-character code WhatsApp shows on your phone). Then exit Claude Code and restart with `--channels plugin:whatsapp@buzzie-ai`."*
-   - **Linked, allowlist empty, policy `pairing`** → *"Send any message to yourself on WhatsApp. The bot replies with a pairing code; approve with* `/whatsapp:access pair <code>` *to capture your own JID. Texting yourself bypasses pairing once you're in."*
-   - **Linked, someone allowed, policy still `pairing`** → *"Lock down with* `/whatsapp:access policy allowlist`. *Pairing should only be on while you're capturing IDs."*
-   - **Linked, policy `allowlist`** → *"Locked. Anyone new needs to be added explicitly with* `/whatsapp:access allow <jid>`."
-
-**Push toward lockdown — always.** `pairing` is a temporary capture mode, not
-a long-term policy. Once known senders are in the allowlist, flip to
-`allowlist`. Don't wait to be asked — offer this proactively.
+   - **Linked, no groups opted in** → *"Send a message to yourself on
+     WhatsApp to drive the session. To use a group as a workspace, run*
+     `/whatsapp:access group add <groupJid>` *— only your own messages in
+     that group will forward; everyone else's are dropped."*
+   - **Linked, groups present** → *"You're set. Self-chat and your own
+     messages in the opted-in groups forward to the session. DMs from
+     other contacts are silently dropped."*
 
 ### `link` — kick off interactive login
 
@@ -112,5 +112,5 @@ Same as no-args.
   links their phone *after* starting Claude Code, they need to restart for
   the channel to pick up the new auth.
 
-- `access.json` is re-read on every inbound message — policy changes via
+- `access.json` is re-read on every inbound message — group changes via
   `/whatsapp:access` take effect immediately, no restart.

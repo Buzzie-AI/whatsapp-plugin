@@ -1,105 +1,85 @@
 # WhatsApp Channel — Access Control Reference
 
-The WhatsApp channel maintains a sender allowlist and DM policy at
-`~/.claude/channels/whatsapp/access.json`. The channel server reads it on
-every inbound message; changes take effect immediately, no restart.
+The WhatsApp channel forwards exactly two things into your Claude Code
+session:
 
-All mutations go through `/whatsapp:access`. Don't hand-edit unless you know
-what you're doing — the file is also written by the server (pairing
-requests).
+1. **Self-chat** — the operator messaging their own WhatsApp number.
+2. **Opted-in groups, operator-only** — messages the operator types into
+   a group whose JID has been opted in via
+   `/whatsapp:access group add <groupJid>`. Other participants in the
+   same group are silently dropped at the server.
+
+DMs from other contacts are **never** forwarded. There is no DM
+allowlist, no pairing flow, no mention-pattern gating. The channel does
+not respond to strangers in any way — their messages reach the server
+log and stop there.
+
+State lives at `~/.claude/channels/whatsapp/access.json`. The server
+re-reads it on every inbound message — changes take effect immediately,
+no restart.
 
 ## State shape
 
 ```json
 {
-  "dmPolicy": "pairing",
-  "allowFrom": ["60123456789@s.whatsapp.net"],
   "groups": {
-    "120363012345@g.us": {
-      "requireMention": true,
-      "allowFrom": []
-    }
-  },
-  "pending": {
-    "x9k2m4": {
-      "senderId": "65987654321@s.whatsapp.net",
-      "chatId":   "65987654321@s.whatsapp.net",
-      "senderName": "Alice",
-      "createdAt": 1714421500000,
-      "expiresAt": 1714422100000
-    }
-  },
-  "mentionPatterns": ["@claude", "hey claude"]
+    "120363012345@g.us": {}
+  }
 }
 ```
 
-| Field            | Type                  | Meaning |
-| ---------------- | --------------------- | ------- |
-| `dmPolicy`       | `pairing` \| `allowlist` \| `disabled` | What to do with inbound DMs from senders not in `allowFrom`. |
-| `allowFrom`      | `string[]`            | JIDs trusted to push events into the session. Self-chat is implicitly allowed regardless. |
-| `groups`         | `object`              | Per-group config — only listed groups are forwarded at all. |
-| `pending`        | `object`              | Active pairing codes. Server-managed; don't write here. |
-| `mentionPatterns`| `string[]`            | Regex strings (case-insensitive). At least one must match the message body for `requireMention: true` group messages to forward. |
+| Field    | Type     | Meaning |
+| -------- | -------- | ------- |
+| `groups` | `object` | Map of opted-in group JIDs to (currently empty) config objects. Membership in `groups` is the entire signal — only operator-typed messages from these groups forward. |
 
-### DM policies
+Missing file = `{groups:{}}`. Legacy v0.4.x files (with `dmPolicy`,
+`allowFrom`, `pending`, `mentionPatterns`, or per-group `requireMention`
+/ `allowFrom`) are self-healed on first read — extraneous fields are
+dropped and the cleaned form is written back. No manual migration step.
 
-- **`pairing`** (default): unknown senders get a 6-char code; they're DM'd
-  with instructions to ask the operator to run `/whatsapp:access pair <code>`.
-  The session also receives a `kind="pairing_request"` notification.
-- **`allowlist`**: unknown senders are silently dropped. Use this once you've
-  paired everyone who should reach the session.
-- **`disabled`**: every DM from a non-allowlisted sender is dropped. Self-chat
-  still works.
+## Self-chat
 
-## Self-chat is special
+Texting yourself on WhatsApp always works. The whatsapp-channel client
+detects self-chat by matching the chat JID against `whoami().selfChatJid`
+and the LID twin, both during canonicalization. You don't need to
+configure anything; self-chat is not represented in `access.json`.
 
-When you message yourself on WhatsApp (your own number), the channel server
-treats you as automatically trusted. You don't need to pair, and you don't
-appear in `allowFrom`. This mirrors how the iMessage channel handles your own
-addresses.
+## Operator-only group forwarding
+
+The operator's own JID is identified by matching `evt.sender` against
+both `me.id` (PN form, e.g. `60123456789@s.whatsapp.net`) and `me.lid`
+(LID twin, e.g. `60123456789@lid`). Both are device-suffix-stripped by
+the whatsapp-channel client, and so is `evt.sender`, so a literal `===`
+comparison covers both delivery shapes that WhatsApp uses.
+
+This means: only you — from the same WhatsApp account this server is
+linked to — can drive the session by typing into a group. Other
+participants' messages in the same group are dropped silently. Group
+membership is opt-in per group; the channel forwards nothing from a
+group that hasn't been added.
 
 ## Commands
 
 ```text
 /whatsapp:access                          # show current state
-/whatsapp:access pair <code>              # approve a pending pairing
-/whatsapp:access deny <code>              # reject a pending pairing
-/whatsapp:access allow <jid>              # add a JID to the allowlist directly
-/whatsapp:access remove <jid>             # remove a JID from the allowlist
-/whatsapp:access policy <pairing|allowlist|disabled>
-/whatsapp:access group add <groupJid> [--no-mention] [--allow jid1,jid2]
-/whatsapp:access group rm <groupJid>
-/whatsapp:access mention add <regex>      # add a mention pattern
-/whatsapp:access mention rm <regex>       # remove a mention pattern
+/whatsapp:access group add <groupJid>     # opt a group in (operator-only)
+/whatsapp:access group rm <groupJid>      # opt a group out
 ```
 
 JIDs:
 
-- 1:1 chats: `<phone>@s.whatsapp.net` (e.g. `60123456789@s.whatsapp.net`)
 - groups: `<id>@g.us` (e.g. `120363012345@g.us`)
 
-## Pairing flow
-
-1. An unknown sender DMs your linked number.
-2. Server generates a 6-char code (lowercase, no `l`), stores it in
-   `pending`, and DMs the sender:
-   *"Pairing requested. Ask the operator to run: /whatsapp:access pair x9k2m4"*
-3. The session also receives a notification with `meta.kind="pairing_request"`
-   and the code.
-4. You run `/whatsapp:access pair x9k2m4` in Claude Code. The skill:
-   - Adds `senderId` to `allowFrom`.
-   - Deletes the `pending` entry.
-   - Writes a flag file to `~/.claude/channels/whatsapp/approved/<sanitized>`.
-5. The server's `fs.watch` on the approved dir picks up the flag, DMs the
-   sender *"You're paired"*, and deletes the flag.
-
-Codes expire after 10 minutes.
+Find a group's JID by sending any message into it and watching the
+`[in]` line in `~/.claude/channels/whatsapp/server.log` — `from=<jid>`
+is the group JID. (You can also opt the group in first and then check
+the log; the message will still drop until your own message hits, but
+the JID is logged.)
 
 ## Permission relay
 
-When Claude tries to use a tool that requires approval (Bash, Write, Edit),
-the local terminal dialog opens **and** a prompt is sent through the most
-recent trusted WhatsApp chat:
+When Claude tries to use a tool that requires approval (Bash, Write,
+Edit), the prompt is sent through the most recent trusted WhatsApp chat:
 
 ```
 Claude wants to run Bash: list the files in this directory
@@ -107,47 +87,28 @@ Claude wants to run Bash: list the files in this directory
 Reply "yes abcde" or "no abcde".
 ```
 
-Reply from WhatsApp with `yes <id>` or `no <id>` (any of `y`/`yes`/`n`/`no`,
-case-insensitive — phone autocorrect-friendly). The first answer to arrive
-wins; if you answer at the terminal first, the remote prompt is dropped.
+Reply with `yes <id>` or `no <id>` from the same chat (any of `y`/`yes`/
+`n`/`no`, case-insensitive — phone autocorrect-friendly). The first
+answer to arrive wins; if you answer at the terminal first, the remote
+prompt is dropped.
 
-Only senders in `allowFrom` (or self) can answer prompts. A verdict from an
-unknown sender is treated as a regular message and ignored.
-
-## Group chats
-
-Groups are off by default — even if you're an admin of a group, the channel
-won't forward its messages until you opt the group in.
-
-```text
-/whatsapp:access group add 120363012345@g.us
-/whatsapp:access mention add @claude
-```
-
-With `requireMention: true`, the group's messages only forward when the body
-matches one of the `mentionPatterns`. With `requireMention: false`, every
-message in the group forwards, which is rarely what you want for an active
-group.
-
-To restrict who in a group can reach Claude:
-
-```text
-/whatsapp:access group add 120363012345@g.us --allow 60123456789@s.whatsapp.net,60198765432@s.whatsapp.net
-```
-
-Empty `allowFrom` on a group entry means "any participant" (still subject to
-`requireMention`).
+Only self-chat and opted-in groups can be a relay target — those are
+the only places the channel forwards from. Verdicts from other senders
+in the same group fail the trust check (they're not the operator) and
+fall through to the drop.
 
 ## Threat model
 
-- **Anyone who DMs your linked WhatsApp number** can trigger a pairing code
-  exchange. The code itself is harmless; it's only useful if approved from
-  your terminal.
-- **`pairing` is not a long-term policy.** Treat it as a capture mode. Switch
-  to `allowlist` once everyone who should reach the session is in.
-- **Permission relay grants trusted senders the ability to approve tool
-  calls in your session.** Only allow JIDs you'd hand the keyboard to.
-- **Group `allowFrom` does not protect against compromised group
-  membership.** A group admin adding a malicious participant could push
-  events if they match the mention pattern. Prefer DM allowlists for
-  high-trust scenarios.
+- **Anyone who DMs your linked WhatsApp number** is silently ignored.
+  The server sees the message, drops it with reason
+  `dm-forwarding-disabled`, and never responds. No pairing prompts, no
+  auto-replies, nothing visible.
+- **Group membership is trust on the operator's identity, not on the
+  group composition.** Even an admin adding malicious participants
+  can't push events into the session — only messages whose sender JID
+  matches the linked account's `me.id`/`me.lid` forward.
+- **Permission relay grants approval power to whoever can produce a
+  message that reaches the relay chat.** Under the operator-only model
+  that's exclusively the operator (self-chat, or operator-typed-in-an-
+  opted-in-group). The trust surface collapses to "the operator's own
+  WhatsApp account."

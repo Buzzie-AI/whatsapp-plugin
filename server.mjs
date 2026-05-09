@@ -6,9 +6,10 @@
 // AND normalizes the inbound stream — envelope unwrapping, LID-twin
 // canonicalization, echo dedup, history/live split, and JID coercion all live
 // in the package. What's left here is purely Claude-Code policy: the MCP tool
-// surface, access control (DM pairing / group allowlist / mention regex),
-// pairing-code lifecycle, and the permission relay. Self-chat is auto-allowed;
-// everyone else pairs via /whatsapp:access.
+// surface, the operator-only access gate, and the permission relay. The
+// channel forwards exactly two things: (a) self-chat — the operator messaging
+// their own number — and (b) the operator's own messages in groups they've
+// opted into via /whatsapp:access. Nothing else reaches the session.
 
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -17,10 +18,8 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
-  readdirSync,
   statSync,
   unlinkSync,
-  watch,
   writeFileSync,
 } from 'node:fs';
 
@@ -42,12 +41,10 @@ import {
 // ── Paths ───────────────────────────────────────────────────────────────────
 const CHANNEL_DIR = join(homedir(), '.claude', 'channels', 'whatsapp');
 const ACCESS_PATH = join(CHANNEL_DIR, 'access.json');
-const APPROVED_DIR = join(CHANNEL_DIR, 'approved');
 const LOG_PATH = join(CHANNEL_DIR, 'server.log');
 const LOG_MAX_BYTES = 5 * 1024 * 1024; // rotate at 5MB
 
 mkdirSync(CHANNEL_DIR, { recursive: true });
-mkdirSync(APPROVED_DIR, { recursive: true });
 
 // ── Logging ─────────────────────────────────────────────────────────────────
 // MCP keeps stdout reserved for JSON-RPC. Tee everything diagnostic to:
@@ -138,44 +135,59 @@ try {
 }
 
 // ── Access state ────────────────────────────────────────────────────────────
+// The shape is `{ groups: { "<jid>@g.us": {} } }`. Group entries are tracked
+// as a map (rather than an array) so future per-group metadata can land
+// without another file format break. Membership in `groups` = "opted-in";
+// only operator-typed messages from these groups forward.
 function defaultAccess() {
-  return {
-    dmPolicy: 'pairing', // pairing | allowlist | disabled
-    allowFrom: [],
-    groups: {},
-    pending: {},
-    mentionPatterns: [],
-  };
+  return { groups: {} };
 }
 
+// Read access.json, normalizing legacy v0.4.x shapes onto the minimal
+// v0.5+ form. Any pre-existing keys (`dmPolicy`, `allowFrom`, `pending`,
+// `mentionPatterns`, plus per-group `requireMention` / `allowFrom`) are
+// dropped silently and the cleaned form is written back. Missing file =
+// defaults; malformed JSON = defaults but DO NOT rewrite (preserve the
+// broken file for recovery).
 function readAccess() {
+  let raw = null;
   try {
-    if (!existsSync(ACCESS_PATH)) return defaultAccess();
-    const data = JSON.parse(readFileSync(ACCESS_PATH, 'utf8'));
-    return { ...defaultAccess(), ...data };
+    if (existsSync(ACCESS_PATH)) {
+      raw = JSON.parse(readFileSync(ACCESS_PATH, 'utf8'));
+    }
   } catch (err) {
     console.warn('access.json unreadable, using defaults:', err.message);
     return defaultAccess();
   }
+
+  const cleaned = { groups: {} };
+  if (raw && typeof raw === 'object' && raw.groups && typeof raw.groups === 'object') {
+    for (const jid of Object.keys(raw.groups)) {
+      cleaned.groups[jid] = {};
+    }
+  }
+
+  // Self-heal: write the cleaned shape back if on-disk differs (covers
+  // legacy field strip and first-run file creation).
+  const onDisk = raw ? JSON.stringify(raw) : null;
+  const target = JSON.stringify(cleaned);
+  if (onDisk !== target) {
+    try {
+      writeAccess(cleaned);
+    } catch (err) {
+      console.warn('access.json migration write failed:', err.message);
+    }
+  }
+  return cleaned;
 }
 
 function writeAccess(state) {
   writeFileSync(ACCESS_PATH, JSON.stringify(state, null, 2) + '\n', 'utf8');
 }
 
-// 6-char pairing code; lowercase, no `l` (avoids l/1 confusion on phones).
-const PAIR_ALPHABET = 'abcdefghijkmnopqrstuvwxyz0123456789';
-function newPairingCode() {
-  let code = '';
-  for (let i = 0; i < 6; i++) {
-    code += PAIR_ALPHABET[Math.floor(Math.random() * PAIR_ALPHABET.length)];
-  }
-  return code;
-}
-
 // ── MCP server ──────────────────────────────────────────────────────────────
 const mcp = new Server(
-  { name: 'whatsapp', version: '0.4.2' },
+  { name: 'whatsapp', version: '0.5.0' },
   {
     capabilities: {
       experimental: {
@@ -186,25 +198,21 @@ const mcp = new Server(
     },
     instructions:
       'You are bridged to WhatsApp via this channel. Inbound messages arrive as:\n' +
-      '<channel source="plugin:whatsapp:whatsapp" kind="dm|group|self|pairing_request" chat_id="..." sender="..." sender_name="..." msg_id="..." from_me="0|1">{body}</channel>\n' +
-      '\nThis server exposes tools in two availability tiers. Channel-gated tools only appear on turns that include a <channel> event from this server; do not call them speculatively. The unsolicited-outbound tool (`send`) is intended to be available regardless of channel context, for cron-fired alerts and autonomous notifications.\n' +
+      '<channel source="plugin:whatsapp:whatsapp" kind="self|group" chat_id="..." sender="..." sender_name="..." msg_id="..." from_me="0|1">{body}</channel>\n' +
+      '\nThis server forwards exactly two things into the session: (a) self-chat (the operator messaging their own WhatsApp number) and (b) messages the operator types into a group that has been opted in via /whatsapp:access. Nothing else reaches you — DMs from other contacts and messages from other group participants are silently dropped at the server. There is no DM allowlist and no pairing flow.\n' +
+      '\nThis server exposes tools in two availability tiers. Channel-gated tools only appear on turns that include a <channel> event. The unsolicited-outbound tool (`send`) is always available, for cron-fired alerts and autonomous notifications.\n' +
       '\nTools available regardless of channel context:\n' +
       '• `send` — fire an unsolicited outbound message. params: `text` (required), `chat_id` (optional; defaults to the operator self-chat). Use for cron-fired alerts, capital events, autopilot pings.\n' +
       '\nTools attached only on turns that include a <channel> event:\n' +
       '• `reply` — params: `chat_id` (string, the JID from the tag, KEEP the @s.whatsapp.net or @g.us suffix) and `text` (string, the outgoing message). The param is named `text`, not `body`/`message`/`content`.\n' +
       '• `react` — params: `chat_id`, `message_id` (use the `msg_id` attribute from the inbound tag), `emoji` (single emoji, or `""` to remove). For group reactions also pass `participant` (the sender JID). Use react instead of reply when a lightweight ack suffices.\n' +
       '\nKind values:\n' +
-      '• `dm` — a 1:1 chat with another contact.\n' +
-      '• `group` — a group chat (only forwarded if the operator has opted the group in via /whatsapp:access).\n' +
-      '• `self` — the operator messaging their own number ("self-chat"). This is the primary remote-control pattern. Always reply.\n' +
-      '• `pairing_request` — a new contact wants to pair. DO NOT auto-approve. Tell the operator in plaintext to run `/whatsapp:access pair <code>` (pulled from the tag). Do not call `reply` for this kind.\n' +
-      '\nfrom_me semantics:\n' +
-      '• `from_me="1"` on `kind="self"` is normal — that\'s how self-chat looks (the operator typing into their own number). Reply normally.\n' +
-      '• `from_me="1"` on `kind="dm"` or `kind="group"` is rare and means the operator typed from their own phone into someone else\'s chat. Don\'t auto-reply unless explicitly addressed.\n' +
+      '• `self` — the operator messaging their own number ("self-chat"). The primary remote-control pattern. Always reply.\n' +
+      '• `group` — the operator typed into an opted-in group. Reply normally; treat the group as a workspace.\n' +
+      '\nfrom_me will typically be "1" for both kinds — the operator is the only sender that ever reaches you. Reply normally regardless of from_me.\n' +
       '\nHard rules:\n' +
-      '1. The sender (except for kind="self") is on WhatsApp and CANNOT see your terminal output. Plaintext responses here are invisible to them — only the `reply` tool reaches them.\n' +
-      '2. Don\'t narrate the inbound back to the operator. The operator can already see the channel line.\n' +
-      '3. Permission prompts can be relayed: a trusted sender can reply `yes <id>` or `no <id>` from the same chat to approve/deny tool prompts.',
+      '1. Don\'t narrate the inbound back to the operator. The operator can already see the channel line.\n' +
+      '2. Permission prompts are relayed back through the same chat — the operator can reply `yes <id>` or `no <id>` to approve/deny tool prompts.',
   },
 );
 
@@ -215,9 +223,9 @@ const mcp = new Server(
 let waClient = null;
 
 // Thin logging wrapper around client.send. Used by every outbound site
-// (tool handlers, permission relay, approval ack, pairing prompt) so the
-// `[send]` log format stays consistent. `to` accepts digits or JID — the
-// client coerces internally.
+// (tool handlers and the permission relay) so the `[send]` log format
+// stays consistent. `to` accepts digits or JID — the client coerces
+// internally.
 async function safeSend(to, content, options) {
   if (!waClient) throw new Error('WhatsApp client not connected');
   const kind = content.text ? 'text' : content.react ? 'react' : 'media';
@@ -399,37 +407,6 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
 // matches "y abcde", "yes abcde", "n abcde", "no abcde" — letters only, no `l`
 const PERMISSION_REPLY_RE = /^\s*(y|yes|n|no)\s+([a-km-z0-9]{5,8})\s*$/i;
 
-// ── Approval watcher ────────────────────────────────────────────────────────
-// /whatsapp:access pair <code> writes ~/.claude/channels/whatsapp/approved/<senderId>
-// with the chatId as the file body. We DM "you're paired" then delete it.
-function processApprovals() {
-  let entries;
-  try {
-    entries = readdirSync(APPROVED_DIR);
-  } catch {
-    return;
-  }
-  for (const file of entries) {
-    const path = join(APPROVED_DIR, file);
-    let chatId = '';
-    try {
-      chatId = readFileSync(path, 'utf8').trim();
-    } catch {
-      continue;
-    }
-    if (!chatId || !waClient) continue;
-    safeSend(chatId, {
-      text: '✅ You are paired with this Claude Code session. Send me a message to get started.',
-    })
-      .catch((err) => console.warn('approval ack failed:', err.message))
-      .finally(() => {
-        try { unlinkSync(path); } catch { /* ignore */ }
-      });
-  }
-}
-
-watch(APPROVED_DIR, { persistent: false }, () => processApprovals());
-
 // ── Connect to WhatsApp and wire up message routing ─────────────────────────
 // authDir is hoisted up above the lock block.
 
@@ -471,8 +448,13 @@ async function startWhatsApp() {
     console.warn(`[boot] presence update failed: ${err.message}`);
   }
 
-  // Catch up on any access.json approvals that landed before the watcher armed.
-  processApprovals();
+  // Operator self-check, closed over `me`. The whatsapp-channel client strips
+  // the :device suffix from both whoami() and inbound `sender`, so a literal
+  // === comparison covers both PN-form and LID-twin participant deliveries.
+  function isOperator(sender) {
+    if (!sender || !me) return false;
+    return sender === me.id || sender === me.lid;
+  }
 
   // Inbound — the client emits cooked InboundEvents on 'inbound' (live messages
   // only; history goes to 'history'). Echo dedup, envelope unwrapping, LID
@@ -517,9 +499,13 @@ async function startWhatsApp() {
     const isGroup = kind === 'group';
     const access = readAccess();
 
-    // Permission-verdict path: only honor verdicts from already-trusted senders.
+    // Trust = self-chat OR the operator typing from the linked account.
+    // Both sides are the only senders that ever produce a forwarded message.
+    const operator = isOperator(sender);
+    const trusted = isSelf || operator;
+
+    // Permission-verdict path: only honor verdicts from trusted senders.
     const verdict = PERMISSION_REPLY_RE.exec(text.trim());
-    const trusted = isSelf || access.allowFrom.includes(sender);
     if (verdict && trusted) {
       const requestId = verdict[2].toLowerCase();
       const open = pendingPermissions.get(requestId);
@@ -536,71 +522,22 @@ async function startWhatsApp() {
     }
 
     // ── Decide whether to forward ──
-    // `kind` is already on the InboundEvent; no recomputation needed.
+    // Two-rule contract: self-chat always; opted-in groups only when the
+    // sender is the operator. DMs from anyone else are silently dropped.
     let allowed = false;
-    let pairingCode = null;
-
+    let dropReason = '';
     if (isSelf) {
       allowed = true;
     } else if (isGroup) {
-      const groupCfg = access.groups[chatId];
-      if (groupCfg) {
-        const senderOk =
-          !groupCfg.allowFrom?.length || groupCfg.allowFrom.includes(sender);
-        const mentionOk = groupCfg.requireMention
-          ? matchesMention(text, access.mentionPatterns)
-          : true;
-        allowed = senderOk && mentionOk;
-      }
+      if (!access.groups[chatId])      dropReason = 'group-not-opted-in';
+      else if (!operator)              dropReason = 'group-not-operator';
+      else                             allowed = true;
     } else {
-      // DM
-      if (access.dmPolicy === 'disabled') {
-        allowed = false;
-      } else if (access.dmPolicy === 'allowlist') {
-        allowed = access.allowFrom.includes(sender);
-      } else {
-        // pairing
-        if (access.allowFrom.includes(sender)) {
-          allowed = true;
-        } else {
-          pairingCode = await issuePairingCode(sender, chatId, senderName);
-        }
-      }
-    }
-
-    if (pairingCode) {
-      console.warn(`[in] decision=pairing-requested code=${pairingCode} sender=${sender} chat=${chatId}`);
-      // Surface the pairing event in the session so Claude can prompt the user
-      // (and also DM the requester so they know it's pending).
-      await safeSend(chatId, {
-        text:
-          `Pairing requested. Ask the operator to run:\n` +
-          `  /whatsapp:access pair ${pairingCode}\n` +
-          `(code expires in 10 minutes)`,
-      }).catch(() => {});
-      lastInboundChat = { chatId, senderId: sender };
-      console.warn(`[in] forward kind=pairing_request chat=${chatId} sender=${sender}`);
-      await mcp.notification({
-        method: 'notifications/claude/channel',
-        params: {
-          content: `New pairing request from ${senderName} (${sender.split('@')[0]}). Run /whatsapp:access pair ${pairingCode} to approve, or /whatsapp:access deny ${pairingCode} to reject.`,
-          meta: {
-            kind: 'pairing_request',
-            chat_id: chatId,
-            sender: sender,
-            sender_name: senderName,
-            pairing_code: pairingCode,
-          },
-        },
-      });
-      return;
+      dropReason = 'dm-forwarding-disabled';
     }
 
     if (!allowed) {
-      const dropReason = isGroup
-        ? (access.groups[chatId] ? 'group-filter-mismatch' : 'group-not-opted-in')
-        : (access.dmPolicy === 'disabled' ? 'dm-policy-disabled' : 'dm-not-allowlisted');
-      console.warn(`[in] decision=dropped kind=${kind} reason=${dropReason} sender=${sender} chat=${chatId} dmPolicy=${access.dmPolicy}`);
+      console.warn(`[in] decision=dropped kind=${kind} reason=${dropReason} sender=${sender} chat=${chatId}`);
       return; // silent drop
     }
 
@@ -623,44 +560,6 @@ async function startWhatsApp() {
       },
     });
   }
-}
-
-function matchesMention(text, patterns) {
-  if (!Array.isArray(patterns) || patterns.length === 0) return false;
-  for (const p of patterns) {
-    try {
-      if (new RegExp(p, 'i').test(text)) return true;
-    } catch {
-      /* ignore bad regex */
-    }
-  }
-  return false;
-}
-
-async function issuePairingCode(senderId, chatId, senderName) {
-  const access = readAccess();
-  // Reuse an existing un-expired code for the same sender (don't spam codes).
-  const now = Date.now();
-  for (const [code, entry] of Object.entries(access.pending || {})) {
-    if (entry.senderId === senderId && entry.expiresAt > now) return code;
-  }
-  // Drop expired entries.
-  for (const [code, entry] of Object.entries(access.pending || {})) {
-    if (entry.expiresAt <= now) delete access.pending[code];
-  }
-  let code;
-  do {
-    code = newPairingCode();
-  } while (access.pending[code]);
-  access.pending[code] = {
-    senderId,
-    chatId,
-    senderName,
-    createdAt: now,
-    expiresAt: now + 10 * 60 * 1000,
-  };
-  writeAccess(access);
-  return code;
 }
 
 // ── Boot ────────────────────────────────────────────────────────────────────
